@@ -12,7 +12,6 @@
   },
   "dependencies": {
     "express": "^4.19.0",
-    "youtubei.js": "16.0.1",
-    "ioredis": "^5.4.1"
+    "youtubei.js": "16.0.1"
   }
 }
