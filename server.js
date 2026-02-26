@@ -81,7 +81,7 @@ let yt;
 (async () => {
   try {
     yt = await Innertube.create({
-      client_type: "WEB"
+      client_type: "ANDROID"
     });
   } catch (e) {
     console.error("failed to initialize Innertube", e);
