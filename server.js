@@ -90,9 +90,62 @@ function rotateInstances(list, key) {
   return good.length ? good : rotated;
 }
 
+/* ---------------- HLS Utilities ---------------- */
+
+async function resolveHlsVariant(manifestUrl) {
+
+  try {
+
+    const res = await fetch(manifestUrl);
+    if (!res.ok) return manifestUrl;
+
+    const text = await res.text();
+    const lines = text.split("\n");
+
+    const variants = [];
+
+    for (let i = 0; i < lines.length; i++) {
+
+      const line = lines[i];
+
+      if (line.startsWith("#EXT-X-STREAM-INF")) {
+
+        const next = lines[i + 1];
+
+        const match = line.match(/RESOLUTION=(\d+)x(\d+)/);
+        const height = match ? Number(match[2]) : 0;
+
+        if (next && !next.startsWith("#")) {
+
+          const url = new URL(next, manifestUrl).href;
+
+          variants.push({
+            url,
+            height
+          });
+
+        }
+
+      }
+
+    }
+
+    if (!variants.length) return manifestUrl;
+
+    variants.sort((a,b)=>b.height-a.height);
+
+    return variants[0].url;
+
+  } catch {
+    return manifestUrl;
+  }
+
+}
+
 /* ---------------- Format Utilities ---------------- */
 
 function parseUrl(format) {
+
   if (format.url) return format.url;
 
   const cipher =
@@ -107,9 +160,11 @@ function parseUrl(format) {
   } catch {
     return null;
   }
+
 }
 
 function normalizeFormats(sd) {
+
   return [
     ...(sd.formats || []),
     ...(sd.adaptive_formats || [])
@@ -117,36 +172,41 @@ function normalizeFormats(sd) {
     ...f,
     mime: (f.mimeType || f.mime_type || "").toLowerCase()
   }));
+
 }
 
 function selectBestVideo(formats) {
+
   return formats
     .filter(f => f.mime.includes("video"))
     .sort((a,b)=>
       (b.height || 0) - (a.height || 0) ||
       (b.bitrate || 0) - (a.bitrate || 0)
     )[0] || null;
+
 }
 
 function selectBestAudio(formats) {
+
   return formats
     .filter(f => f.mime.includes("audio"))
     .sort((a,b)=>
       (b.bitrate || 0) - (a.bitrate || 0)
     )[0] || null;
+
 }
 
 function selectBestProgressive(formats) {
-  const candidates = formats
+
+  return formats
     .filter(f =>
       f.mime.includes("video") &&
       /mp4a|aac|opus/.test(f.mime)
     )
     .sort((a,b)=>
       (b.height || 0) - (a.height || 0)
-    );
+    )[0] || null;
 
-  return candidates[0] || null;
 }
 
 /* ---------------- Parallel Fetch ---------------- */
@@ -179,8 +239,10 @@ async function fastestFetch(instances, buildUrl, parser) {
       return parsed;
 
     } catch {
+
       markBad(base);
       throw new Error();
+
     }
 
   });
@@ -190,6 +252,7 @@ async function fastestFetch(instances, buildUrl, parser) {
   controllers.forEach(c => c.abort());
 
   return result;
+
 }
 
 /* ---------------- Providers ---------------- */
@@ -205,6 +268,13 @@ async function fetchFromInvidious(id) {
     instances,
     base => `${base}/api/v1/videos/${id}`,
     data => {
+
+      if (data.hlsUrl) {
+        return {
+          provider: "invidious",
+          streaming_data: { hlsManifestUrl: data.hlsUrl }
+        };
+      }
 
       const formats = [];
 
@@ -227,6 +297,7 @@ async function fetchFromInvidious(id) {
 
     }
   );
+
 }
 
 async function fetchFromPiped(id) {
@@ -241,17 +312,22 @@ async function fetchFromPiped(id) {
     base => `${base}/streams/${id}`,
     data => {
 
+      if (data.hls) {
+
+        return {
+          provider: "piped",
+          streaming_data: { hlsManifestUrl: data.hls }
+        };
+
+      }
+
       const formats = [];
 
       if (data.videoStreams)
-        data.videoStreams.forEach(v =>
-          formats.push({ ...v })
-        );
+        data.videoStreams.forEach(v => formats.push(v));
 
       if (data.audioStreams)
-        data.audioStreams.forEach(a =>
-          formats.push({ ...a })
-        );
+        data.audioStreams.forEach(a => formats.push(a));
 
       if (!formats.length) return null;
 
@@ -262,6 +338,7 @@ async function fetchFromPiped(id) {
 
     }
   );
+
 }
 
 async function fetchFromInnertube(id) {
@@ -276,6 +353,7 @@ async function fetchFromInnertube(id) {
     provider: "innertube",
     streaming_data: info.streaming_data
   };
+
 }
 
 async function fetchStreamingInfo(id) {
@@ -284,17 +362,20 @@ async function fetchStreamingInfo(id) {
   try { return await fetchFromPiped(id); } catch {}
 
   return fetchFromInnertube(id);
+
 }
 
 /* ---------------- Auth ---------------- */
 
 function safeEqual(a,b){
+
   const A = Buffer.from(a,"hex");
   const B = Buffer.from(b,"hex");
 
   if (A.length !== B.length) return false;
 
   return crypto.timingSafeEqual(A,B);
+
 }
 
 function verifyWorkerAuth(req,res,next){
@@ -321,6 +402,7 @@ function verifyWorkerAuth(req,res,next){
     return res.status(401).json({error:"unauthorized"});
 
   next();
+
 }
 
 /* ---------------- API ---------------- */
@@ -330,17 +412,29 @@ app.get("/api/stream", verifyWorkerAuth, async (req,res)=>{
   try{
 
     const id = req.query.id;
+
     if (!id)
       return res.status(400).json({error:"id required"});
 
     const info = await fetchStreamingInfo(id);
     const sd = info.streaming_data;
 
-    if (sd.hlsManifestUrl || sd.hls_manifest_url) {
+    /* HLS */
+
+    const hls =
+      sd.hlsManifestUrl ||
+      sd.hls_manifest_url ||
+      sd.hlsUrl ||
+      sd.hls;
+
+    if (hls) {
+
+      const variant = await resolveHlsVariant(hls);
 
       return res.json({
-        type:"live",
-        url: sd.hlsManifestUrl || sd.hls_manifest_url,
+        type: "hls",
+        url: variant,
+        manifest: hls,
         provider: info.provider
       });
 
@@ -348,7 +442,7 @@ app.get("/api/stream", verifyWorkerAuth, async (req,res)=>{
 
     const formats = normalizeFormats(sd);
 
-    /* ---- Highest quality first ---- */
+    /* DASH */
 
     const video = selectBestVideo(formats);
     const audio = selectBestAudio(formats);
@@ -360,12 +454,12 @@ app.get("/api/stream", verifyWorkerAuth, async (req,res)=>{
         quality: video.height || null,
         video_url: parseUrl(video),
         audio_url: parseUrl(audio),
-        video_itag: video.itag,
-        audio_itag: audio.itag,
         provider: info.provider
       });
 
     }
+
+    /* Progressive */
 
     const progressive = selectBestProgressive(formats);
 
@@ -375,7 +469,6 @@ app.get("/api/stream", verifyWorkerAuth, async (req,res)=>{
         type:"progressive",
         quality: progressive.height || null,
         url: parseUrl(progressive),
-        itag: progressive.itag,
         provider: info.provider
       });
 
