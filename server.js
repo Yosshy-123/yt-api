@@ -9,13 +9,11 @@ if (!process.env.WORKER_SECRET) {
 
 const app = express();
 const port = process.env.PORT || 3000;
-
 const WORKER_SECRET = process.env.WORKER_SECRET;
 const ALLOWED_WINDOW = 300;
 const INSTANCE_BAN_MS = 5 * 60 * 1000;
 
 /* ---------------- Instances ---------------- */
-
 const INVIDIOUS_INSTANCES = [
   "https://inv.nadeko.net",
   "https://invidious.f5.si",
@@ -46,32 +44,22 @@ const PIPED_INSTANCES = [
 ];
 
 /* ---------------- Innertube ---------------- */
-
 let ytClient;
-
 async function getYtClient() {
   if (!ytClient) {
-    ytClient = await Innertube.create({
-      client_type: "ANDROID",
-      generate_session_locally: true
-    });
+    ytClient = await Innertube.create({ client_type: "ANDROID", generate_session_locally: true });
   }
   return ytClient;
 }
 
 /* ---------------- Instance Health ---------------- */
-
 const badInstances = new Map();
 const nextIndex = { invidious: 0, piped: 0 };
-
 function markBad(instance) { badInstances.set(instance, Date.now()); }
 function isBad(instance) {
   const t = badInstances.get(instance);
   if (!t) return false;
-  if (Date.now() - t > INSTANCE_BAN_MS) {
-    badInstances.delete(instance);
-    return false;
-  }
+  if (Date.now() - t > INSTANCE_BAN_MS) { badInstances.delete(instance); return false; }
   return true;
 }
 function rotateInstances(list, key) {
@@ -83,7 +71,6 @@ function rotateInstances(list, key) {
 }
 
 /* ---------------- Format Utilities ---------------- */
-
 function parseUrl(format) {
   if (format.url) return format.url;
   const cipher = format.signatureCipher || format.signature_cipher || format.cipher;
@@ -91,7 +78,7 @@ function parseUrl(format) {
   try { return new URLSearchParams(cipher).get("url"); } catch { return null; }
 }
 
-// HLSを完全排除して正規化
+// HLS 完全排除
 function normalizeFormats(sd) {
   return [
     ...(sd.formats || []),
@@ -100,30 +87,25 @@ function normalizeFormats(sd) {
   .map(f => ({ ...f, mime: (f.mimeType || f.mime_type || "").toLowerCase() }))
   .filter(f => {
     const url = parseUrl(f) || "";
-    // .m3u8なら除外
     return !url.endsWith(".m3u8");
   });
 }
 
 function selectBestVideo(formats) {
-  return formats
-    .filter(f => f.mime.includes("video"))
+  return formats.filter(f => f.mime.includes("video"))
     .sort((a,b)=>(b.height||0)-(a.height||0)||(b.bitrate||0)-(a.bitrate||0))[0]||null;
 }
 function selectBestAudio(formats) {
-  return formats
-    .filter(f => f.mime.includes("audio"))
+  return formats.filter(f => f.mime.includes("audio"))
     .sort((a,b)=>(b.bitrate||0)-(a.bitrate||0))[0]||null;
 }
 function selectBestProgressive(formats) {
-  const candidates = formats
-    .filter(f=>f.mime.includes("video")&&/mp4a|aac|opus/.test(f.mime))
+  const candidates = formats.filter(f=>f.mime.includes("video")&&/mp4a|aac|opus/.test(f.mime))
     .sort((a,b)=>(b.height||0)-(a.height||0));
   return candidates[0]||null;
 }
 
 /* ---------------- Parallel Fetch ---------------- */
-
 async function fastestFetch(instances, buildUrl, parser) {
   const controllers = [];
   const tasks = instances.map(async base => {
@@ -144,7 +126,6 @@ async function fastestFetch(instances, buildUrl, parser) {
 }
 
 /* ---------------- Providers ---------------- */
-
 async function fetchFromInvidious(id) {
   const instances = rotateInstances(INVIDIOUS_INSTANCES,"invidious");
   return fastestFetch(instances, base => `${base}/api/v1/videos/${id}`, data => {
@@ -180,14 +161,20 @@ async function fetchStreamingInfo(id) {
   return fetchFromInnertube(id);
 }
 
-/* ---------------- Auth ---------------- */
+/* ---------------- HLS拒否 ---------------- */
+function rejectHls(sd) {
+  const hlsUrl = sd.hlsManifestUrl || sd.hls_manifest_url;
+  if (typeof hlsUrl === "string" && hlsUrl.endsWith(".m3u8")) {
+    throw new Error("HLS streams are not allowed");
+  }
+}
 
+/* ---------------- Auth ---------------- */
 function safeEqual(a,b){
   const A = Buffer.from(a,"hex"), B = Buffer.from(b,"hex");
   if (A.length!==B.length) return false;
   return crypto.timingSafeEqual(A,B);
 }
-
 function verifyWorkerAuth(req,res,next){
   const ts = req.header("x-proxy-timestamp");
   const sig = req.header("x-proxy-signature");
@@ -201,13 +188,17 @@ function verifyWorkerAuth(req,res,next){
 }
 
 /* ---------------- API ---------------- */
-
 app.get("/api/stream", verifyWorkerAuth, async (req,res)=>{
   try {
     const id = req.query.id;
     if (!id) return res.status(400).json({error:"id required"});
 
     const info = await fetchStreamingInfo(id);
+
+    // HLSを完全拒否
+    try { rejectHls(info.streaming_data); } 
+    catch { return res.status(404).json({ error: "HLS streams are not allowed" }); }
+
     const formats = normalizeFormats(info.streaming_data);
 
     const video = selectBestVideo(formats);
