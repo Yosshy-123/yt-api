@@ -4,6 +4,7 @@ import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 import { PassThrough, Readable } from "stream";
+import http from "http";
 
 if (!process.env.WORKER_SECRET) {
   console.error("WORKER_SECRET is required");
@@ -26,9 +27,10 @@ const FORWARD_HEADER_KEYS = new Set([
 ]);
 const ALLOWED_WINDOW = 300; // seconds
 const WORKER_SECRET = process.env.WORKER_SECRET;
-const UPSTREAM_TIMEOUT_MS = 5000; // upstream fetch timeout
 
-if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
+// Timeouts & instance ban
+const UPSTREAM_TIMEOUT_MS = 10_000; // upstream fetch timeout
+const INSTANCE_BAN_MS = 5 * 60 * 1000; // 5 minutes
 
 // ---------------- Instance lists ----------------
 const INVIDIOUS_INSTANCES = [
@@ -69,23 +71,12 @@ const PIPED_INSTANCES = [
   "https://pipedapi.orangenet.cc",
 ];
 
-// ---------------- Instance rotation & health ----------------
-const badInstances = new Map(); // instance -> timestamp of failure
-const INSTANCE_BAN_MS = 5 * 60 * 1000; // 5 minutes
+if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
-function markBad(instance) { badInstances.set(instance, Date.now()); }
-function isBad(instance) {
-  const t = badInstances.get(instance);
-  if (!t) return false;
-  if (Date.now() - t > INSTANCE_BAN_MS) { badInstances.delete(instance); return false; }
-  return true;
-}
-function getInstances(list) {
-  const good = list.filter(i => !isBad(i));
-  return good.length ? good : list;
-}
+// keepalive agent for upstream requests (helps reuse sockets)
+const agent = new http.Agent({ keepAlive: true, maxSockets: 100 });
 
-// ---------------- youtubei.js (Innertube) ----------------
+// youtubei client (fallback)
 let ytPromise = Innertube.create({ client_type: "ANDROID", generate_session_locally: true });
 let ytClient;
 async function getYtClient() {
@@ -93,7 +84,39 @@ async function getYtClient() {
   return ytClient;
 }
 
-// ---------------- Utilities ----------------
+// Instance health + rotation state
+const badInstances = new Map(); // instance -> timestamp when marked bad
+const nextIndex = {
+  invidious: 0,
+  piped: 0
+};
+
+function markBad(instance) {
+  try { badInstances.set(instance, Date.now()); } catch {}
+}
+function isBad(instance) {
+  const t = badInstances.get(instance);
+  if (!t) return false;
+  if (Date.now() - t > INSTANCE_BAN_MS) {
+    badInstances.delete(instance);
+    return false;
+  }
+  return true;
+}
+function getInstancesForProvider(list, providerKey) {
+  // Round-robin starting from nextIndex[providerKey], skipping bad instances if possible.
+  if (!list || list.length === 0) return [];
+  const idx = nextIndex[providerKey] % list.length;
+  // rotate copy so we start from idx, preserving order
+  const rotated = [...list.slice(idx), ...list.slice(0, idx)];
+  // increment pointer for next call
+  nextIndex[providerKey] = (nextIndex[providerKey] + 1) % list.length;
+  // prefer non-bad instances first
+  const good = rotated.filter(i => !isBad(i));
+  return good.length ? good : rotated; // if all bad, still return rotated so they will be tried
+}
+
+// Helpers
 function sha1Key(id, itag) {
   return crypto.createHash("sha1").update(`${id}:${itag}`).digest("hex");
 }
@@ -139,151 +162,176 @@ async function enforceCacheLimit() {
         const s = fs.statSync(p);
         return { path: p, mtime: s.mtimeMs, size: s.size };
       })
-      .sort((a,b) => a.mtime - b.mtime);
-    let total = files.reduce((acc,f) => acc + f.size, 0);
+      .sort((a, b) => a.mtime - b.mtime);
+    let total = files.reduce((acc, f) => acc + f.size, 0);
     if (total <= MAX_CACHE_BYTES) return;
     for (const f of files) {
       try {
         fs.unlinkSync(f.path);
         total -= f.size;
         if (total <= MAX_CACHE_BYTES) break;
-      } catch {}
+      } catch (e) {
+        // ignore deletion errors
+      }
     }
-  } catch {}
+  } catch (e) {
+    // ignore
+  }
 }
 
-function timingSafeEqualHex(aHex, bHex) {
+// Shared in-progress map for single upstream download shared between clients
+const inProgress = new Map();
+
+// Utility to perform fetch with timeout, headers and agent
+async function safeFetch(url, opts = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
   try {
-    const a = Buffer.from(aHex, "hex");
-    const b = Buffer.from(bHex, "hex");
-    if (a.length !== b.length) return false;
-    return crypto.timingSafeEqual(a, b);
-  } catch { return false; }
+    const headers = Object.assign({
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      "Accept": "*/*",
+      "Referer": "https://www.youtube.com/",
+      "Origin": "https://www.youtube.com"
+    }, opts.headers || {});
+
+    const response = await fetch(url, {
+      method: opts.method || "GET",
+      headers,
+      signal: controller.signal,
+      // pass agent only for http(s) requests using node's fetch? global fetch doesn't accept agent.
+      // If using node's experimental fetch that accepts `agent`, include it. Otherwise ignore.
+      agent: opts.agent || agent
+    });
+
+    clearTimeout(timeout);
+    return response;
+  } catch (e) {
+    clearTimeout(timeout);
+    throw e;
+  }
 }
 
-// ---------------- Worker auth middleware ----------------
-function verifyWorkerAuth(req, res, next) {
-  if (req.method === "OPTIONS") return next();
-  const tsHeader = req.header("x-proxy-timestamp");
-  const sigHeader = req.header("x-proxy-signature");
-  if (!tsHeader || !sigHeader) return res.status(401).json({ error: "unauthorized" });
-  const ts = Number(tsHeader);
-  if (!Number.isFinite(ts)) return res.status(401).json({ error: "unauthorized" });
-  const now = Math.floor(Date.now() / 1000);
-  if (Math.abs(now - ts) > ALLOWED_WINDOW) return res.status(401).json({ error: "unauthorized" });
-  const payload = `${ts}:${req.originalUrl}`;
-  const expected = crypto.createHmac("sha256", WORKER_SECRET).update(payload).digest("hex");
-  if (!timingSafeEqualHex(expected, sigHeader)) return res.status(401).json({ error: "unauthorized" });
-  next();
-}
-
-// ---------------- Providers ----------------
-
+// Providers: try each instance; mark bad on error; return streaming_data or throw
 async function fetchFromInvidious(id) {
-  const instances = getInstances(INVIDIOUS_INSTANCES);
+  if (!INVIDIOUS_INSTANCES || INVIDIOUS_INSTANCES.length === 0) {
+    throw new Error("no invidious instances configured");
+  }
+  const instances = getInstancesForProvider(INVIDIOUS_INSTANCES, "invidious");
   for (const base of instances) {
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
-      const r = await fetch(`${base}/api/v1/videos/${id}`, {
-        headers: { "User-Agent": "Mozilla/5.0" },
-        signal: controller.signal
-      });
-      clearTimeout(timeout);
-      if (!r.ok) throw new Error(`invidious ${base} status ${r.status}`);
-      const data = await r.json();
+      const url = `${base.replace(/\/$/, "")}/api/v1/videos/${id}`;
+      const resp = await safeFetch(url, { agent });
+      if (!resp.ok) {
+        // mark bad and continue; do not throw to bubble up as fatal
+        markBad(base);
+        continue;
+      }
+      const data = await resp.json();
       const formats = [];
-      for (const f of data.formatStreams || []) formats.push({ ...f, mime_type: f.type, itag: f.itag, url: f.url });
-      for (const f of data.adaptiveFormats || []) formats.push({ ...f, mime_type: f.type, itag: f.itag, url: f.url });
-      if (formats.length) return { streaming_data: { formats, adaptive_formats: [] } };
+      // adapt fields that might exist in Invidious responses
+      if (Array.isArray(data.formatStreams)) {
+        for (const f of data.formatStreams) {
+          formats.push({ itag: f.itag, url: f.url, mime_type: f.type, ...f });
+        }
+      }
+      if (Array.isArray(data.adaptiveFormats)) {
+        for (const f of data.adaptiveFormats) {
+          formats.push({ itag: f.itag, url: f.url, mime_type: f.type, ...f });
+        }
+      }
+      if (Array.isArray(data.formats)) {
+        for (const f of data.formats) {
+          formats.push({ itag: f.itag, url: f.url, mime_type: f.mimeType || f.type, ...f });
+        }
+      }
+      if (formats.length) {
+        return { streaming_data: { formats, adaptive_formats: [] } };
+      } else {
+        // no usable formats -> mark bad and continue
+        markBad(base);
+      }
     } catch (e) {
+      // network/parse error, mark bad and try next
       markBad(base);
+      continue;
     }
   }
-  throw new Error("invidious failed");
+  throw new Error("invidious all instances failed");
 }
 
 async function fetchFromPiped(id) {
-  const instances = getInstances(PIPED_INSTANCES);
+  if (!PIPED_INSTANCES || PIPED_INSTANCES.length === 0) {
+    throw new Error("no piped instances configured");
+  }
+  const instances = getInstancesForProvider(PIPED_INSTANCES, "piped");
   for (const base of instances) {
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
-      const r = await fetch(`${base}/streams/${id}`, { signal: controller.signal });
-      clearTimeout(timeout);
-      if (!r.ok) throw new Error(`piped ${base} status ${r.status}`);
-      const data = await r.json();
+      const url = `${base.replace(/\/$/, "")}/streams/${id}`;
+      const resp = await safeFetch(url, { agent });
+      if (!resp.ok) {
+        markBad(base);
+        continue;
+      }
+      const data = await resp.json();
       const formats = [];
-      for (const v of data.videoStreams || []) formats.push({ ...v, mime_type: v.mimeType, itag: v.itag, url: v.url });
-      for (const a of data.audioStreams || []) formats.push({ ...a, mime_type: a.mimeType, itag: a.itag, url: a.url });
-      if (formats.length) return { streaming_data: { formats, adaptive_formats: [] } };
+      if (Array.isArray(data.videoStreams)) {
+        for (const v of data.videoStreams) formats.push({ itag: v.itag, url: v.url, mime_type: v.mimeType || v.type, ...v });
+      }
+      if (Array.isArray(data.audioStreams)) {
+        for (const a of data.audioStreams) formats.push({ itag: a.itag, url: a.url, mime_type: a.mimeType || a.type, ...a });
+      }
+      if (Array.isArray(data.formats)) {
+        for (const f of data.formats) formats.push({ itag: f.itag, url: f.url, mime_type: f.mimeType || f.type, ...f });
+      }
+      if (formats.length) {
+        return { streaming_data: { formats, adaptive_formats: [] } };
+      } else {
+        markBad(base);
+      }
     } catch (e) {
       markBad(base);
+      continue;
     }
   }
-  throw new Error("piped failed");
+  throw new Error("piped all instances failed");
 }
 
 async function fetchFromInnertube(id) {
   const client = await getYtClient();
-  const info = await client.getInfo(id);
-  if (!info?.streaming_data) throw new Error("innertube failed");
-  return { streaming_data: info.streaming_data };
-}
-
-// Choose best progressive (combined audio+video) format. If none, fallback to best video-only.
-function selectBestProgressive(formats) {
-  if (!Array.isArray(formats) || formats.length === 0) return null;
-  // Normalize keys for different providers
-  const norm = formats.map(f => ({
-    original: f,
-    itag: f.itag,
-    url: parseSignatureUrl(f) || f.url || f.urlSimple || null,
-    mime: (f.mime_type || f.mimeType || "").toLowerCase(),
-    has_audio: Boolean(f.has_audio || f.audioBitrate || f.audioQuality || /mp4a|aac|vorbis|opus|audio/.test((f.mime_type||"") + (f.codecs||""))),
-    height: Number(f.height || f.qualityLabel && parseInt((f.qualityLabel||"").replace(/[^0-9]/g,""),10) || f.resolution || 0) || 0,
-    bitrate: Number(f.bitrate || f.audioBitrate || f.bitrateKbps || 0) || 0
-  })).filter(Boolean);
-
-  // Filter combined
-  const combined = norm.filter(f => f.url && f.has_audio && /video/.test(f.mime || "video"));
-  if (combined.length) {
-    // sort by height desc, then bitrate desc
-    combined.sort((a,b) => (b.height - a.height) || (b.bitrate - a.bitrate));
-    return combined[0].original;
+  try {
+    const info = await client.getInfo(id);
+    if (info && info.streaming_data) return { streaming_data: info.streaming_data };
+    // fallback to getStreamingData
+    const sd = await client.getStreamingData(id);
+    if (sd) {
+      const streaming_data = (sd.formats || sd.adaptive_formats) ? sd
+        : { formats: Array.isArray(sd) ? sd : [sd], adaptive_formats: [] };
+      return { streaming_data };
+    }
+  } catch (e) {
+    throw new Error("innertube failed: " + String(e?.message || e));
   }
-
-  // Fallback: choose best single file that likely contains both audio (by codecs) or highest height
-  const codecsCombined = norm.filter(f => f.url && /mp4a|aac|opus|vorbis/.test(f.mime));
-  if (codecsCombined.length) {
-    codecsCombined.sort((a,b) => (b.height - a.height) || (b.bitrate - a.bitrate));
-    return codecsCombined[0].original;
-  }
-
-  // Final fallback: best video-only
-  const videos = norm.filter(f => f.url && /video/.test(f.mime || "") );
-  if (videos.length) {
-    videos.sort((a,b) => (b.height - a.height) || (b.bitrate - a.bitrate));
-    return videos[0].original;
-  }
-
-  // Very last resort: first format that has a url
-  const any = norm.find(f => f.url);
-  return any ? any.original : null;
+  throw new Error("innertube streaming data unavailable");
 }
 
 async function fetchStreamingInfo(id) {
-  try { return await fetchFromInvidious(id); } catch (e) { /* continue */ }
-  try { return await fetchFromPiped(id); } catch (e) { /* continue */ }
-  try { return await fetchFromInnertube(id); } catch (e) { /* continue */ }
-  throw new Error("all providers failed");
+  // Try providers in order. If provider-level failure, move to next.
+  try {
+    return await fetchFromInvidious(id);
+  } catch (e) {
+    // console.debug("Invidious failed:", e?.message || e);
+  }
+  try {
+    return await fetchFromPiped(id);
+  } catch (e) {
+    // console.debug("Piped failed:", e?.message || e);
+  }
+  // Final fallback
+  return await fetchFromInnertube(id);
 }
 
-// ---------------- Shared in-progress downloads ----------------
-const inProgress = new Map();
-
-async function startBackgroundDownload(key, url) {
-  // If already in progress, return existing entry
+// Shared download starter — improved error handling for non-ok upstream responses
+async function startSharedDownload(key, url) {
   if (inProgress.has(key)) return inProgress.get(key);
 
   const tmpPath = tmpPathForKey(key);
@@ -295,31 +343,36 @@ async function startBackgroundDownload(key, url) {
     finalPath,
     headers: null,
     status: null,
-    clients: new Set(),
     ready: null,
     resolve: null,
     reject: null,
-    headersReady: null,
-    _resolveHeaders: null
+    clients: new Set()
   };
-
-  entry.ready = new Promise((res, rej) => { entry.resolve = res; entry.reject = rej; });
-  entry.headersReady = new Promise((res) => { entry._resolveHeaders = res; });
+  let resolveFn, rejectFn;
+  entry.ready = new Promise((r, j) => { resolveFn = r; rejectFn = j; });
+  entry.resolve = resolveFn;
+  entry.reject = rejectFn;
 
   inProgress.set(key, entry);
 
   (async () => {
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
-      const resp = await fetch(url, { signal: controller.signal });
-      clearTimeout(timeout);
+      const resp = await safeFetch(url, { agent });
+      if (!resp.ok) {
+        // upstream refused (403/4xx/5xx). reject entry and remove it.
+        const err = new Error(`upstream status ${resp.status}`);
+        try { entry.reject(err); } catch {}
+        inProgress.delete(key);
+        // notify any attached clients: end them politely
+        for (const r of entry.clients) {
+          try { r.status(502).json({ error: "upstream error" }); } catch {}
+        }
+        return;
+      }
 
-      if (!resp.ok) throw new Error(`upstream status ${resp.status}`);
-
-      // create headers object to forward to clients
+      // collect forwardable headers
       const headersObj = {};
-      for (const [k,v] of resp.headers) {
+      for (const [k, v] of resp.headers) {
         try {
           const lk = k.toLowerCase();
           if (FORWARD_HEADER_KEYS.has(lk)) headersObj[lk] = v;
@@ -327,37 +380,55 @@ async function startBackgroundDownload(key, url) {
       }
       entry.headers = headersObj;
       entry.status = resp.status;
-      // notify headers ready
-      try { entry._resolveHeaders(); } catch {}
 
-      if (!resp.body) throw new Error("no body");
+      if (!resp.body) {
+        const err = new Error("no body");
+        try { entry.reject(err); } catch {}
+        inProgress.delete(key);
+        for (const r of entry.clients) {
+          try { r.status(502).json({ error: "no upstream body" }); } catch {}
+        }
+        return;
+      }
+
       const ws = fs.createWriteStream(tmpPath);
-
       const stream = typeof resp.body.pipe === "function" ? resp.body : Readable.fromWeb(resp.body);
-      stream.on("error", (e) => { try { ws.destroy(e); } catch(_){} entry.reject(e); });
-      ws.on("error", (e) => { try { stream.destroy(e); } catch(_){} entry.reject(e); });
 
-      // stream to shared pass and file
+      stream.on("error", (e) => {
+        try { ws.destroy(e); } catch {}
+        try { entry.pass.destroy(e); } catch {}
+        try { entry.reject(e); } catch {}
+      });
+      ws.on("error", (e) => {
+        try { stream.destroy(e); } catch {}
+        try { entry.pass.destroy(e); } catch {}
+        try { entry.reject(e); } catch {}
+      });
+
+      // pipe to shared pass and to disk
       stream.pipe(entry.pass);
       stream.pipe(ws);
 
+      // wait for both to finish
       await Promise.all([
-        new Promise((r,j) => { stream.on("end", r); stream.on("error", j); }),
-        new Promise((r,j) => { ws.on("finish", r); ws.on("error", j); })
+        new Promise((r, j) => { stream.on("end", r); stream.on("error", j); }),
+        new Promise((r, j) => { ws.on("finish", r); ws.on("error", j); })
       ]);
 
-      try { ws.end(); } catch(_) {}
+      // finalize
+      try { ws.end(); } catch {}
       if (fs.existsSync(tmpPath)) {
-        try { fs.renameSync(tmpPath, finalPath); } catch (e) {}
-        entry.resolve();
+        try { fs.renameSync(tmpPath, finalPath); } catch {}
+        try { entry.resolve(); } catch {}
         inProgress.delete(key);
         await enforceCacheLimit();
       } else {
-        entry.reject(new Error("tmp missing"));
+        const err = new Error("tmp missing");
+        try { entry.reject(err); } catch {}
         inProgress.delete(key);
       }
     } catch (e) {
-      entry.reject(e);
+      try { entry.reject(e); } catch {}
       inProgress.delete(key);
     }
   })();
@@ -365,28 +436,21 @@ async function startBackgroundDownload(key, url) {
   return entry;
 }
 
-// Attach res to existing entry (non-range safe)
-function attachClientToEntry(entry, res) {
+// Attach client to shared entry (non-range)
+function attachClient(entry, res) {
   try {
-    // set status and headers if available; otherwise wait for headersReady
     if (entry.headers) {
       try {
         res.status(entry.status || 200);
-        for (const [k,v] of Object.entries(entry.headers)) res.setHeader(k, v);
-        // ensure Accept-Ranges and Content-Type exist
+        for (const [k, v] of Object.entries(entry.headers)) {
+          try { res.setHeader(k, v); } catch {}
+        }
         if (!res.getHeader("accept-ranges")) res.setHeader("Accept-Ranges", "bytes");
-        if (!res.getHeader("content-type")) res.setHeader("Content-Type", "application/octet-stream");
       } catch {}
     } else {
-      // wait until headers are ready (non-blocking)
-      entry.headersReady.then(() => {
-        try {
-          res.status(entry.status || 200);
-          for (const [k,v] of Object.entries(entry.headers || {})) res.setHeader(k, v);
-          if (!res.getHeader("accept-ranges")) res.setHeader("Accept-Ranges", "bytes");
-          if (!res.getHeader("content-type")) res.setHeader("Content-Type", "application/octet-stream");
-        } catch {}
-      }).catch(() => {});
+      // If headers not ready yet, set minimal
+      res.status(200);
+      res.setHeader("Accept-Ranges", "bytes");
     }
 
     entry.clients.add(res);
@@ -394,7 +458,7 @@ function attachClientToEntry(entry, res) {
 
     const onClose = () => {
       entry.clients.delete(res);
-      try { entry.pass.unpipe(res); } catch (_) {}
+      try { entry.pass.unpipe(res); } catch {}
     };
     res.once("close", onClose);
     res.once("finish", onClose);
@@ -403,39 +467,118 @@ function attachClientToEntry(entry, res) {
   }
 }
 
-// ---------------- API: /api/stream ----------------
+// Worker auth
+function timingSafeEqualHex(aHex, bHex) {
+  try {
+    const a = Buffer.from(aHex, "hex");
+    const b = Buffer.from(bHex, "hex");
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
+  } catch (e) {
+    return false;
+  }
+}
+function verifyWorkerAuth(req, res, next) {
+  if (req.method === "OPTIONS") return next();
+  const tsHeader = req.header("x-proxy-timestamp");
+  const sigHeader = req.header("x-proxy-signature");
+  if (!tsHeader || !sigHeader) {
+    console.error("auth failed: missing headers");
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  const ts = Number(tsHeader);
+  if (!Number.isFinite(ts)) {
+    console.error("auth failed: invalid timestamp header");
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  const now = Math.floor(Date.now() / 1000);
+  if (Math.abs(now - ts) > ALLOWED_WINDOW) {
+    console.error("auth failed: timestamp outside allowed window");
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  const payload = `${ts}:${req.originalUrl}`; // must match Worker payload
+  const expected = crypto.createHmac("sha256", WORKER_SECRET).update(payload).digest("hex");
+  if (!timingSafeEqualHex(expected, sigHeader)) {
+    console.error("auth failed: signature mismatch");
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  next();
+}
+
+// choose progressive (muxed) best format; fallback to best video-only
+function selectBestProgressive(formats) {
+  if (!Array.isArray(formats) || formats.length === 0) return null;
+  const norm = formats.map(f => ({
+    original: f,
+    itag: f.itag,
+    url: parseSignatureUrl(f) || f.url || f.urlSimple || null,
+    mime: (f.mime_type || f.mimeType || "").toLowerCase(),
+    has_audio: Boolean(f.has_audio || f.audioBitrate || f.audioQuality || /mp4a|aac|vorbis|opus|audio/.test((f.mime_type||"") + (f.codecs||""))),
+    height: Number(f.height || (f.qualityLabel && parseInt((f.qualityLabel||"").replace(/[^0-9]/g,""),10)) || f.resolution || 0) || 0,
+    bitrate: Number(f.bitrate || f.audioBitrate || f.bitrateKbps || 0) || 0
+  })).filter(Boolean);
+
+  const combined = norm.filter(f => f.url && f.has_audio && /video/.test(f.mime || "video"));
+  if (combined.length) {
+    combined.sort((a,b) => (b.height - a.height) || (b.bitrate - a.bitrate));
+    return combined[0].original;
+  }
+
+  const codecsCombined = norm.filter(f => f.url && /mp4a|aac|opus|vorbis/.test(f.mime));
+  if (codecsCombined.length) {
+    codecsCombined.sort((a,b) => (b.height - a.height) || (b.bitrate - a.bitrate));
+    return codecsCombined[0].original;
+  }
+
+  const videos = norm.filter(f => f.url && /video/.test(f.mime || ""));
+  if (videos.length) {
+    videos.sort((a,b) => (b.height - a.height) || (b.bitrate - a.bitrate));
+    return videos[0].original;
+  }
+
+  const any = norm.find(f => f.url);
+  return any ? any.original : null;
+}
+
 app.get("/api/stream", verifyWorkerAuth, async (req, res) => {
   try {
     const id = req.query.id;
     if (!id) return res.status(400).json({ error: "id required" });
 
-    // get streaming info (providers chain)
-    const info = await fetchStreamingInfo(id);
+    // Get streaming info (tries Invidious -> Piped -> Innertube)
+    let info;
+    try {
+      info = await fetchStreamingInfo(id);
+    } catch (e) {
+      console.error("fetchStreamingInfo failed:", e?.message || e);
+      return res.status(502).json({ error: "no streaming info" });
+    }
+
     const sd = info.streaming_data || {};
     const formats = [...(sd.formats || []), ...(sd.adaptive_formats || [])].filter(Boolean);
     if (!formats.length) return res.status(404).json({ error: "no formats" });
 
-    // choose best progressive (combined) format
-    const chosenFormat = selectBestProgressive(formats);
-    if (!chosenFormat) return res.status(404).json({ error: "no usable format" });
+    // choose best progressive (muxed)
+    const chosen = selectBestProgressive(formats);
+    if (!chosen) return res.status(404).json({ error: "no suitable format" });
 
-    // allow overriding itag via query param (optional)
-    let itag = req.query.itag ? Number(req.query.itag) : chosenFormat.itag;
-    const format = formats.find(f => f.itag === itag) || chosenFormat;
+    // allow override via query.itag
+    let itag = req.query.itag ? Number(req.query.itag) : chosen.itag;
+    const format = formats.find(f => f.itag === itag) || chosen;
     const url = parseSignatureUrl(format) || format.url;
     if (!url) return res.status(422).json({ error: "format has no direct url" });
 
     const key = sha1Key(id, format.itag);
     const finalPath = filePathForKey(key);
+    const tmpPath = tmpPathForKey(key);
     const range = req.headers.range;
 
-    // If file cached -> serve from disk (support range)
+    // If cached -> serve from disk (range supported)
     if (fs.existsSync(finalPath)) {
       const stat = fs.statSync(finalPath);
       const size = stat.size;
       res.setHeader("Accept-Ranges", "bytes");
-      const contentType = (format.mime_type || format.mimeType || "").split(";")[0] || "application/octet-stream";
-      res.setHeader("Content-Type", contentType);
+      res.setHeader("Content-Type", (format.mime_type || format.mimeType || "").split(";")[0] || "application/octet-stream");
 
       if (range) {
         const r = parseRangeHeader(range, size);
@@ -457,45 +600,51 @@ app.get("/api/stream", verifyWorkerAuth, async (req, res) => {
       }
     }
 
-    // Not cached
+    // Not cached: check if shared in-progress exists
     const ongoing = inProgress.get(key);
 
-    // If there's an ongoing shared download
     if (ongoing) {
-      // Range requests: serve separately (can't satisfy arbitrary range from shared pass)
+      // If client requested a Range, we cannot reliably use the shared pass, fetch partial separately
       if (range) {
         try {
-          const upstream = await fetch(url, { headers: { Range: range } });
+          const upstream = await safeFetch(url, { headers: { Range: range }, agent });
+          // forward status and allowed headers
           res.status(upstream.status);
-          for (const [k,v] of upstream.headers) {
-            try { if (FORWARD_HEADER_KEYS.has(k.toLowerCase())) res.setHeader(k, v); } catch {}
+          for (const [k, v] of upstream.headers) {
+            try {
+              const lk = k.toLowerCase();
+              if (FORWARD_HEADER_KEYS.has(lk)) res.setHeader(lk, v);
+            } catch {}
           }
           if (!upstream.body) return res.status(502).json({ error: "no upstream body" });
           const upstreamStream = typeof upstream.body.pipe === "function" ? upstream.body : Readable.fromWeb(upstream.body);
           upstreamStream.on("error", () => { try { res.destroy(); } catch (e) {} });
           upstreamStream.pipe(res);
-          // ensure background download exists
-          startBackgroundDownload(key, url).catch(()=>{});
+          // ensure background exists
+          startSharedDownload(key, url).catch(()=>{});
           return;
         } catch (e) {
           return res.status(502).json({ error: "upstream error" });
         }
       } else {
-        // non-range — attach to shared stream
-        attachClientToEntry(ongoing, res);
+        // attach to shared pass
+        attachClient(ongoing, res);
         return;
       }
     }
 
-    // No ongoing inProgress
+    // No ongoing
     if (range) {
-      // Start background full download (so subsequent clients benefit), but serve this range immediately separately
-      startBackgroundDownload(key, url).catch(()=>{});
+      // Start full background download for caching, but serve this range immediately via direct upstream range request
+      startSharedDownload(key, url).catch(()=>{});
       try {
-        const upstream = await fetch(url, { headers: { Range: range } });
+        const upstream = await safeFetch(url, { headers: { Range: range }, agent });
         res.status(upstream.status);
-        for (const [k,v] of upstream.headers) {
-          try { if (FORWARD_HEADER_KEYS.has(k.toLowerCase())) res.setHeader(k, v); } catch {}
+        for (const [k, v] of upstream.headers) {
+          try {
+            const lk = k.toLowerCase();
+            if (FORWARD_HEADER_KEYS.has(lk)) res.setHeader(lk, v);
+          } catch {}
         }
         if (!upstream.body) return res.status(502).json({ error: "no upstream body" });
         const upstreamStream = typeof upstream.body.pipe === "function" ? upstream.body : Readable.fromWeb(upstream.body);
@@ -506,18 +655,17 @@ app.get("/api/stream", verifyWorkerAuth, async (req, res) => {
         return res.status(502).json({ error: "upstream error" });
       }
     } else {
-      // No range, start a shared download and attach this client
-      const entry = await startBackgroundDownload(key, url);
-      attachClientToEntry(entry, res);
+      // Start shared download and attach this client
+      const entry = await startSharedDownload(key, url);
+      attachClient(entry, res);
       return;
     }
   } catch (e) {
-    console.error("stream handler error:", e?.message || e);
+    console.error("unexpected handler error:", String(e?.message || e));
     try { res.status(500).json({ error: String(e?.message || e) }); } catch {}
   }
 });
 
-// ---------------- Start server ----------------
 app.listen(port, () => {
   console.log(`Server listening on ${port}`);
 });
