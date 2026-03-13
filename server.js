@@ -21,20 +21,11 @@ const INVIDIOUS_INSTANCES = [
   "https://inv.nadeko.net",
   "https://invidious.f5.si",
   "https://invidious.lunivers.trade",
-  "https://invidious.ducks.party",
   "https://iv.melmac.space",
   "https://yt.omada.cafe",
   "https://invidious.nerdvpn.de",
-  "https://invidious.privacyredirect.com",
-  "https://invidious.technicalvoid.dev",
-  "https://invidious.darkness.services",
-  "https://invidious.nikkosphere.com",
-  "https://invidious.schenkel.eti.br",
   "https://invidious.tiekoetter.com",
-  "https://invidious.perennialte.ch",
-  "https://invidious.reallyaweso.me",
-  "https://invidious.private.coffee",
-  "https://invidious.privacydev.net",
+  "https://yewtu.be",
 ];
 
 const PIPED_INSTANCES = [
