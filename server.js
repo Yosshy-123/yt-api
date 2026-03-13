@@ -4,7 +4,6 @@ import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 import { PassThrough, Readable } from "stream";
-import http from "http";
 
 if (!process.env.WORKER_SECRET) {
   console.error("WORKER_SECRET is required");
@@ -14,7 +13,7 @@ if (!process.env.WORKER_SECRET) {
 const app = express();
 const port = process.env.PORT || 3000;
 const CACHE_DIR = path.resolve(process.cwd(), "cache");
-const MAX_CACHE_BYTES = 5 * 1024 * 1024 * 1024; // 5GB
+const MAX_CACHE_BYTES = 5 * 1024 * 1024 * 1024;
 const FORWARD_HEADER_KEYS = new Set([
   "content-type",
   "content-length",
@@ -25,58 +24,23 @@ const FORWARD_HEADER_KEYS = new Set([
   "etag",
   "last-modified"
 ]);
-const ALLOWED_WINDOW = 300; // seconds
+const ALLOWED_WINDOW = 300;
 const WORKER_SECRET = process.env.WORKER_SECRET;
+const UPSTREAM_TIMEOUT_MS = 10000;
+const INSTANCE_BAN_MS = 5 * 60 * 1000;
 
-// Timeouts & instance ban
-const UPSTREAM_TIMEOUT_MS = 10_000; // upstream fetch timeout
-const INSTANCE_BAN_MS = 5 * 60 * 1000; // 5 minutes
-
-// ---------------- Instance lists ----------------
 const INVIDIOUS_INSTANCES = [
-  "https://inv.nadeko.net",
-  "https://invidious.f5.si",
-  "https://invidious.lunivers.trade",
-  "https://invidious.ducks.party",
-  "https://iv.melmac.space",
-  "https://yt.omada.cafe",
-  "https://invidious.nerdvpn.de",
-  "https://invidious.privacyredirect.com",
-  "https://invidious.technicalvoid.dev",
-  "https://invidious.darkness.services",
-  "https://invidious.nikkosphere.com",
-  "https://invidious.schenkel.eti.br",
-  "https://invidious.tiekoetter.com",
-  "https://invidious.perennialte.ch",
-  "https://invidious.reallyaweso.me",
-  "https://invidious.private.coffee",
-  "https://invidious.privacydev.net",
+  // "https://inv1.example.com",
+  // "https://inv2.example.com"
 ];
 
 const PIPED_INSTANCES = [
-  "https://pipedapi.kavin.rocks",
-  "https://pipedapi.leptons.xyz",
-  "https://pipedapi.nosebs.ru",
-  "https://pipedapi-libre.kavin.rocks",
-  "https://piped-api.privacy.com.de",
-  "https://pipedapi.adminforge.de",
-  "https://api.piped.yt",
-  "https://pipedapi.drgns.space",
-  "https://pipedapi.owo.si",
-  "https://pipedapi.ducks.party",
-  "https://piped-api.codespace.cz",
-  "https://pipedapi.reallyaweso.me",
-  "https://api.piped.private.coffee",
-  "https://pipedapi.darkness.services",
-  "https://pipedapi.orangenet.cc",
+  // "https://piped1.example.com",
+  // "https://piped2.example.com"
 ];
 
 if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
-// keepalive agent for upstream requests (helps reuse sockets)
-const agent = new http.Agent({ keepAlive: true, maxSockets: 100 });
-
-// youtubei client (fallback)
 let ytPromise = Innertube.create({ client_type: "ANDROID", generate_session_locally: true });
 let ytClient;
 async function getYtClient() {
@@ -84,12 +48,8 @@ async function getYtClient() {
   return ytClient;
 }
 
-// Instance health + rotation state
-const badInstances = new Map(); // instance -> timestamp when marked bad
-const nextIndex = {
-  invidious: 0,
-  piped: 0
-};
+const badInstances = new Map();
+const nextIndex = { invidious: 0, piped: 0 };
 
 function markBad(instance) {
   try { badInstances.set(instance, Date.now()); } catch {}
@@ -104,19 +64,14 @@ function isBad(instance) {
   return true;
 }
 function getInstancesForProvider(list, providerKey) {
-  // Round-robin starting from nextIndex[providerKey], skipping bad instances if possible.
-  if (!list || list.length === 0) return [];
-  const idx = nextIndex[providerKey] % list.length;
-  // rotate copy so we start from idx, preserving order
+  if (!Array.isArray(list) || list.length === 0) return [];
+  const idx = (nextIndex[providerKey] || 0) % list.length;
+  nextIndex[providerKey] = (idx + 1) % list.length;
   const rotated = [...list.slice(idx), ...list.slice(0, idx)];
-  // increment pointer for next call
-  nextIndex[providerKey] = (nextIndex[providerKey] + 1) % list.length;
-  // prefer non-bad instances first
   const good = rotated.filter(i => !isBad(i));
-  return good.length ? good : rotated; // if all bad, still return rotated so they will be tried
+  return good.length ? good : rotated;
 }
 
-// Helpers
 function sha1Key(id, itag) {
   return crypto.createHash("sha1").update(`${id}:${itag}`).digest("hex");
 }
@@ -170,88 +125,59 @@ async function enforceCacheLimit() {
         fs.unlinkSync(f.path);
         total -= f.size;
         if (total <= MAX_CACHE_BYTES) break;
-      } catch (e) {
-        // ignore deletion errors
-      }
+      } catch {}
     }
-  } catch (e) {
-    // ignore
-  }
+  } catch {}
 }
 
-// Shared in-progress map for single upstream download shared between clients
-const inProgress = new Map();
-
-// Utility to perform fetch with timeout, headers and agent
-async function safeFetch(url, opts = {}) {
+async function fetchWithTimeout(url, opts = {}) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
   try {
-    const headers = Object.assign({
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      "Accept": "*/*",
-      "Referer": "https://www.youtube.com/",
-      "Origin": "https://www.youtube.com"
-    }, opts.headers || {});
-
-    const response = await fetch(url, {
+    const res = await fetch(url, {
       method: opts.method || "GET",
-      headers,
-      signal: controller.signal,
-      // pass agent only for http(s) requests using node's fetch? global fetch doesn't accept agent.
-      // If using node's experimental fetch that accepts `agent`, include it. Otherwise ignore.
-      agent: opts.agent || agent
+      headers: opts.headers,
+      signal: controller.signal
     });
-
     clearTimeout(timeout);
-    return response;
+    return res;
   } catch (e) {
     clearTimeout(timeout);
     throw e;
   }
 }
 
-// Providers: try each instance; mark bad on error; return streaming_data or throw
 async function fetchFromInvidious(id) {
-  if (!INVIDIOUS_INSTANCES || INVIDIOUS_INSTANCES.length === 0) {
-    throw new Error("no invidious instances configured");
-  }
+  if (!INVIDIOUS_INSTANCES.length) throw new Error("no invidious instances configured");
   const instances = getInstancesForProvider(INVIDIOUS_INSTANCES, "invidious");
   for (const base of instances) {
     try {
       const url = `${base.replace(/\/$/, "")}/api/v1/videos/${id}`;
-      const resp = await safeFetch(url, { agent });
+      let resp;
+      try {
+        resp = await fetchWithTimeout(url);
+      } catch (e) {
+        markBad(base);
+        continue;
+      }
       if (!resp.ok) {
-        // mark bad and continue; do not throw to bubble up as fatal
         markBad(base);
         continue;
       }
       const data = await resp.json();
       const formats = [];
-      // adapt fields that might exist in Invidious responses
       if (Array.isArray(data.formatStreams)) {
-        for (const f of data.formatStreams) {
-          formats.push({ itag: f.itag, url: f.url, mime_type: f.type, ...f });
-        }
+        for (const f of data.formatStreams) formats.push({ itag: f.itag, url: f.url, mime_type: f.type, ...f });
       }
       if (Array.isArray(data.adaptiveFormats)) {
-        for (const f of data.adaptiveFormats) {
-          formats.push({ itag: f.itag, url: f.url, mime_type: f.type, ...f });
-        }
+        for (const f of data.adaptiveFormats) formats.push({ itag: f.itag, url: f.url, mime_type: f.type, ...f });
       }
       if (Array.isArray(data.formats)) {
-        for (const f of data.formats) {
-          formats.push({ itag: f.itag, url: f.url, mime_type: f.mimeType || f.type, ...f });
-        }
+        for (const f of data.formats) formats.push({ itag: f.itag, url: f.url, mime_type: f.mimeType || f.type, ...f });
       }
-      if (formats.length) {
-        return { streaming_data: { formats, adaptive_formats: [] } };
-      } else {
-        // no usable formats -> mark bad and continue
-        markBad(base);
-      }
+      if (formats.length) return { streaming_data: { formats, adaptive_formats: [] } };
+      markBad(base);
     } catch (e) {
-      // network/parse error, mark bad and try next
       markBad(base);
       continue;
     }
@@ -260,14 +186,18 @@ async function fetchFromInvidious(id) {
 }
 
 async function fetchFromPiped(id) {
-  if (!PIPED_INSTANCES || PIPED_INSTANCES.length === 0) {
-    throw new Error("no piped instances configured");
-  }
+  if (!PIPED_INSTANCES.length) throw new Error("no piped instances configured");
   const instances = getInstancesForProvider(PIPED_INSTANCES, "piped");
   for (const base of instances) {
     try {
       const url = `${base.replace(/\/$/, "")}/streams/${id}`;
-      const resp = await safeFetch(url, { agent });
+      let resp;
+      try {
+        resp = await fetchWithTimeout(url);
+      } catch (e) {
+        markBad(base);
+        continue;
+      }
       if (!resp.ok) {
         markBad(base);
         continue;
@@ -283,11 +213,8 @@ async function fetchFromPiped(id) {
       if (Array.isArray(data.formats)) {
         for (const f of data.formats) formats.push({ itag: f.itag, url: f.url, mime_type: f.mimeType || f.type, ...f });
       }
-      if (formats.length) {
-        return { streaming_data: { formats, adaptive_formats: [] } };
-      } else {
-        markBad(base);
-      }
+      if (formats.length) return { streaming_data: { formats, adaptive_formats: [] } };
+      markBad(base);
     } catch (e) {
       markBad(base);
       continue;
@@ -301,7 +228,6 @@ async function fetchFromInnertube(id) {
   try {
     const info = await client.getInfo(id);
     if (info && info.streaming_data) return { streaming_data: info.streaming_data };
-    // fallback to getStreamingData
     const sd = await client.getStreamingData(id);
     if (sd) {
       const streaming_data = (sd.formats || sd.adaptive_formats) ? sd
@@ -315,28 +241,48 @@ async function fetchFromInnertube(id) {
 }
 
 async function fetchStreamingInfo(id) {
-  // Try providers in order. If provider-level failure, move to next.
-  try {
-    return await fetchFromInvidious(id);
-  } catch (e) {
-    // console.debug("Invidious failed:", e?.message || e);
-  }
-  try {
-    return await fetchFromPiped(id);
-  } catch (e) {
-    // console.debug("Piped failed:", e?.message || e);
-  }
-  // Final fallback
+  try { return await fetchFromInvidious(id); } catch (e) {}
+  try { return await fetchFromPiped(id); } catch (e) {}
   return await fetchFromInnertube(id);
 }
 
-// Shared download starter — improved error handling for non-ok upstream responses
+function selectBestProgressive(formats) {
+  if (!Array.isArray(formats) || formats.length === 0) return null;
+  const norm = formats.map(f => ({
+    original: f,
+    itag: f.itag,
+    url: parseSignatureUrl(f) || f.url || null,
+    mime: (f.mime_type || f.mimeType || "").toLowerCase(),
+    has_audio: Boolean(f.has_audio || f.audioBitrate || f.audioQuality || /mp4a|aac|vorbis|opus|audio/.test((f.mime_type||"") + (f.codecs||""))),
+    height: Number(f.height || (f.qualityLabel && parseInt((f.qualityLabel||"").replace(/[^0-9]/g,""),10)) || f.resolution || 0) || 0,
+    bitrate: Number(f.bitrate || f.audioBitrate || f.bitrateKbps || 0) || 0
+  })).filter(Boolean);
+
+  const combined = norm.filter(f => f.url && f.has_audio && /video/.test(f.mime || "video"));
+  if (combined.length) {
+    combined.sort((a,b) => (b.height - a.height) || (b.bitrate - a.bitrate));
+    return combined[0].original;
+  }
+  const codecsCombined = norm.filter(f => f.url && /mp4a|aac|opus|vorbis/.test(f.mime));
+  if (codecsCombined.length) {
+    codecsCombined.sort((a,b) => (b.height - a.height) || (b.bitrate - a.bitrate));
+    return codecsCombined[0].original;
+  }
+  const videos = norm.filter(f => f.url && /video/.test(f.mime || ""));
+  if (videos.length) {
+    videos.sort((a,b) => (b.height - a.height) || (b.bitrate - a.bitrate));
+    return videos[0].original;
+  }
+  const any = norm.find(f => f.url);
+  return any ? any.original : null;
+}
+
+const inProgress = new Map();
+
 async function startSharedDownload(key, url) {
   if (inProgress.has(key)) return inProgress.get(key);
-
   const tmpPath = tmpPathForKey(key);
   const finalPath = filePathForKey(key);
-
   const entry = {
     pass: new PassThrough(),
     tmpPath,
@@ -352,25 +298,31 @@ async function startSharedDownload(key, url) {
   entry.ready = new Promise((r, j) => { resolveFn = r; rejectFn = j; });
   entry.resolve = resolveFn;
   entry.reject = rejectFn;
-
   inProgress.set(key, entry);
 
   (async () => {
     try {
-      const resp = await safeFetch(url, { agent });
-      if (!resp.ok) {
-        // upstream refused (403/4xx/5xx). reject entry and remove it.
-        const err = new Error(`upstream status ${resp.status}`);
-        try { entry.reject(err); } catch {}
+      let resp;
+      try {
+        resp = await fetchWithTimeout(url);
+      } catch (e) {
+        try { entry.reject(e); } catch {}
         inProgress.delete(key);
-        // notify any attached clients: end them politely
         for (const r of entry.clients) {
-          try { r.status(502).json({ error: "upstream error" }); } catch {}
+          try { if (!r.headersSent) r.status(502).json({ error: "upstream network error" }); else r.end(); } catch {}
         }
         return;
       }
 
-      // collect forwardable headers
+      if (!resp.ok) {
+        try { entry.reject(new Error(`upstream status ${resp.status}`)); } catch {}
+        inProgress.delete(key);
+        for (const r of entry.clients) {
+          try { if (!r.headersSent) r.status(502).json({ error: "upstream failed", status: resp.status }); else r.end(); } catch {}
+        }
+        return;
+      }
+
       const headersObj = {};
       for (const [k, v] of resp.headers) {
         try {
@@ -382,11 +334,10 @@ async function startSharedDownload(key, url) {
       entry.status = resp.status;
 
       if (!resp.body) {
-        const err = new Error("no body");
-        try { entry.reject(err); } catch {}
+        try { entry.reject(new Error("no body")); } catch {}
         inProgress.delete(key);
         for (const r of entry.clients) {
-          try { r.status(502).json({ error: "no upstream body" }); } catch {}
+          try { if (!r.headersSent) r.status(502).json({ error: "no upstream body" }); else r.end(); } catch {}
         }
         return;
       }
@@ -394,28 +345,25 @@ async function startSharedDownload(key, url) {
       const ws = fs.createWriteStream(tmpPath);
       const stream = typeof resp.body.pipe === "function" ? resp.body : Readable.fromWeb(resp.body);
 
-      stream.on("error", (e) => {
+      stream.on("error", e => {
         try { ws.destroy(e); } catch {}
         try { entry.pass.destroy(e); } catch {}
         try { entry.reject(e); } catch {}
       });
-      ws.on("error", (e) => {
+      ws.on("error", e => {
         try { stream.destroy(e); } catch {}
         try { entry.pass.destroy(e); } catch {}
         try { entry.reject(e); } catch {}
       });
 
-      // pipe to shared pass and to disk
       stream.pipe(entry.pass);
       stream.pipe(ws);
 
-      // wait for both to finish
       await Promise.all([
         new Promise((r, j) => { stream.on("end", r); stream.on("error", j); }),
         new Promise((r, j) => { ws.on("finish", r); ws.on("error", j); })
       ]);
 
-      // finalize
       try { ws.end(); } catch {}
       if (fs.existsSync(tmpPath)) {
         try { fs.renameSync(tmpPath, finalPath); } catch {}
@@ -423,23 +371,24 @@ async function startSharedDownload(key, url) {
         inProgress.delete(key);
         await enforceCacheLimit();
       } else {
-        const err = new Error("tmp missing");
-        try { entry.reject(err); } catch {}
+        try { entry.reject(new Error("tmp missing")); } catch {}
         inProgress.delete(key);
       }
     } catch (e) {
       try { entry.reject(e); } catch {}
       inProgress.delete(key);
+      for (const r of entry.clients) {
+        try { if (!r.headersSent) r.status(502).json({ error: "download error" }); else r.end(); } catch {}
+      }
     }
   })();
 
   return entry;
 }
 
-// Attach client to shared entry (non-range)
-function attachClient(entry, res) {
+function attachClientToEntry(entry, res) {
   try {
-    if (entry.headers) {
+    if (entry.headers && !res.headersSent) {
       try {
         res.status(entry.status || 200);
         for (const [k, v] of Object.entries(entry.headers)) {
@@ -447,8 +396,7 @@ function attachClient(entry, res) {
         }
         if (!res.getHeader("accept-ranges")) res.setHeader("Accept-Ranges", "bytes");
       } catch {}
-    } else {
-      // If headers not ready yet, set minimal
+    } else if (!res.headersSent) {
       res.status(200);
       res.setHeader("Accept-Ranges", "bytes");
     }
@@ -467,7 +415,6 @@ function attachClient(entry, res) {
   }
 }
 
-// Worker auth
 function timingSafeEqualHex(aHex, bHex) {
   try {
     const a = Buffer.from(aHex, "hex");
@@ -496,7 +443,7 @@ function verifyWorkerAuth(req, res, next) {
     console.error("auth failed: timestamp outside allowed window");
     return res.status(401).json({ error: "unauthorized" });
   }
-  const payload = `${ts}:${req.originalUrl}`; // must match Worker payload
+  const payload = `${ts}:${req.originalUrl}`;
   const expected = crypto.createHmac("sha256", WORKER_SECRET).update(payload).digest("hex");
   if (!timingSafeEqualHex(expected, sigHeader)) {
     console.error("auth failed: signature mismatch");
@@ -505,47 +452,11 @@ function verifyWorkerAuth(req, res, next) {
   next();
 }
 
-// choose progressive (muxed) best format; fallback to best video-only
-function selectBestProgressive(formats) {
-  if (!Array.isArray(formats) || formats.length === 0) return null;
-  const norm = formats.map(f => ({
-    original: f,
-    itag: f.itag,
-    url: parseSignatureUrl(f) || f.url || f.urlSimple || null,
-    mime: (f.mime_type || f.mimeType || "").toLowerCase(),
-    has_audio: Boolean(f.has_audio || f.audioBitrate || f.audioQuality || /mp4a|aac|vorbis|opus|audio/.test((f.mime_type||"") + (f.codecs||""))),
-    height: Number(f.height || (f.qualityLabel && parseInt((f.qualityLabel||"").replace(/[^0-9]/g,""),10)) || f.resolution || 0) || 0,
-    bitrate: Number(f.bitrate || f.audioBitrate || f.bitrateKbps || 0) || 0
-  })).filter(Boolean);
-
-  const combined = norm.filter(f => f.url && f.has_audio && /video/.test(f.mime || "video"));
-  if (combined.length) {
-    combined.sort((a,b) => (b.height - a.height) || (b.bitrate - a.bitrate));
-    return combined[0].original;
-  }
-
-  const codecsCombined = norm.filter(f => f.url && /mp4a|aac|opus|vorbis/.test(f.mime));
-  if (codecsCombined.length) {
-    codecsCombined.sort((a,b) => (b.height - a.height) || (b.bitrate - a.bitrate));
-    return codecsCombined[0].original;
-  }
-
-  const videos = norm.filter(f => f.url && /video/.test(f.mime || ""));
-  if (videos.length) {
-    videos.sort((a,b) => (b.height - a.height) || (b.bitrate - a.bitrate));
-    return videos[0].original;
-  }
-
-  const any = norm.find(f => f.url);
-  return any ? any.original : null;
-}
-
 app.get("/api/stream", verifyWorkerAuth, async (req, res) => {
   try {
     const id = req.query.id;
     if (!id) return res.status(400).json({ error: "id required" });
 
-    // Get streaming info (tries Invidious -> Piped -> Innertube)
     let info;
     try {
       info = await fetchStreamingInfo(id);
@@ -558,11 +469,9 @@ app.get("/api/stream", verifyWorkerAuth, async (req, res) => {
     const formats = [...(sd.formats || []), ...(sd.adaptive_formats || [])].filter(Boolean);
     if (!formats.length) return res.status(404).json({ error: "no formats" });
 
-    // choose best progressive (muxed)
     const chosen = selectBestProgressive(formats);
     if (!chosen) return res.status(404).json({ error: "no suitable format" });
 
-    // allow override via query.itag
     let itag = req.query.itag ? Number(req.query.itag) : chosen.itag;
     const format = formats.find(f => f.itag === itag) || chosen;
     const url = parseSignatureUrl(format) || format.url;
@@ -573,12 +482,12 @@ app.get("/api/stream", verifyWorkerAuth, async (req, res) => {
     const tmpPath = tmpPathForKey(key);
     const range = req.headers.range;
 
-    // If cached -> serve from disk (range supported)
     if (fs.existsSync(finalPath)) {
       const stat = fs.statSync(finalPath);
       const size = stat.size;
       res.setHeader("Accept-Ranges", "bytes");
-      res.setHeader("Content-Type", (format.mime_type || format.mimeType || "").split(";")[0] || "application/octet-stream");
+      const contentType = (format.mime_type || format.mimeType || "").split(";")[0] || "application/octet-stream";
+      res.setHeader("Content-Type", contentType);
 
       if (range) {
         const r = parseRangeHeader(range, size);
@@ -600,15 +509,16 @@ app.get("/api/stream", verifyWorkerAuth, async (req, res) => {
       }
     }
 
-    // Not cached: check if shared in-progress exists
     const ongoing = inProgress.get(key);
-
     if (ongoing) {
-      // If client requested a Range, we cannot reliably use the shared pass, fetch partial separately
       if (range) {
         try {
-          const upstream = await safeFetch(url, { headers: { Range: range }, agent });
-          // forward status and allowed headers
+          let upstream;
+          try {
+            upstream = await fetchWithTimeout(url, { headers: { Range: range } });
+          } catch (e) {
+            return res.status(502).json({ error: "upstream network error" });
+          }
           res.status(upstream.status);
           for (const [k, v] of upstream.headers) {
             try {
@@ -620,25 +530,26 @@ app.get("/api/stream", verifyWorkerAuth, async (req, res) => {
           const upstreamStream = typeof upstream.body.pipe === "function" ? upstream.body : Readable.fromWeb(upstream.body);
           upstreamStream.on("error", () => { try { res.destroy(); } catch (e) {} });
           upstreamStream.pipe(res);
-          // ensure background exists
           startSharedDownload(key, url).catch(()=>{});
           return;
         } catch (e) {
           return res.status(502).json({ error: "upstream error" });
         }
       } else {
-        // attach to shared pass
-        attachClient(ongoing, res);
+        attachClientToEntry(ongoing, res);
         return;
       }
     }
 
-    // No ongoing
     if (range) {
-      // Start full background download for caching, but serve this range immediately via direct upstream range request
       startSharedDownload(key, url).catch(()=>{});
       try {
-        const upstream = await safeFetch(url, { headers: { Range: range }, agent });
+        let upstream;
+        try {
+          upstream = await fetchWithTimeout(url, { headers: { Range: range } });
+        } catch (e) {
+          return res.status(502).json({ error: "upstream network error" });
+        }
         res.status(upstream.status);
         for (const [k, v] of upstream.headers) {
           try {
@@ -655,9 +566,8 @@ app.get("/api/stream", verifyWorkerAuth, async (req, res) => {
         return res.status(502).json({ error: "upstream error" });
       }
     } else {
-      // Start shared download and attach this client
       const entry = await startSharedDownload(key, url);
-      attachClient(entry, res);
+      attachClientToEntry(entry, res);
       return;
     }
   } catch (e) {
