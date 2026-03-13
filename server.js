@@ -34,7 +34,7 @@ let INVIDIOUS_INSTANCES = [
   "https://invidious.nerdvpn.de",
   "https://invidious.tiekoetter.com",
   "https://yewtu.be",
-].join(",")).split(",").map(s => s.trim()).filter(Boolean);
+].join(",").split(",").map(s => s.trim()).filter(Boolean);
 
 let PIPED_INSTANCES = [
   "https://pipedapi.kavin.rocks",
@@ -52,7 +52,7 @@ let PIPED_INSTANCES = [
   "https://api.piped.private.coffee",
   "https://pipedapi.darkness.services",
   "https://pipedapi.orangenet.cc",
-].join(",")).split(",").map(s => s.trim()).filter(Boolean);
+].join(",").split(",").map(s => s.trim()).filter(Boolean);
 
 // ---------- Innertube ----------
 let ytPromise = Innertube.create({ client_type: "ANDROID", generate_session_locally: true });
