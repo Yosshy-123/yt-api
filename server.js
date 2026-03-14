@@ -72,58 +72,6 @@ function rotateInstances(list, key) {
   return good.length ? good : rotated;
 }
 
-/* ---------------- HLS Utilities ---------------- */
-
-async function resolveHlsVariant(manifestUrl) {
-
-  try {
-
-    const res = await fetch(manifestUrl);
-    if (!res.ok) return manifestUrl;
-
-    const text = await res.text();
-    const lines = text.split("\n");
-
-    const variants = [];
-
-    for (let i = 0; i < lines.length; i++) {
-
-      const line = lines[i];
-
-      if (line.startsWith("#EXT-X-STREAM-INF")) {
-
-        const next = lines[i + 1];
-
-        const match = line.match(/RESOLUTION=(\d+)x(\d+)/);
-        const height = match ? Number(match[2]) : 0;
-
-        if (next && !next.startsWith("#")) {
-
-          const url = new URL(next, manifestUrl).href;
-
-          variants.push({
-            url,
-            height
-          });
-
-        }
-
-      }
-
-    }
-
-    if (!variants.length) return manifestUrl;
-
-    variants.sort((a,b)=>b.height-a.height);
-
-    return variants[0].url;
-
-  } catch {
-    return manifestUrl;
-  }
-
-}
-
 /* ---------------- Format Utilities ---------------- */
 
 function parseUrl(format) {
@@ -250,21 +198,6 @@ async function fetchFromInvidious(id) {
     instances,
     base => `${base}/api/v1/videos/${id}`,
     data => {
-
-      if (data.hlsUrl) {
-
-        const url = data.hlsUrl.startsWith("http")
-          ? data.hlsUrl
-          : base + data.hlsUrl;
-
-        return {
-          provider: "invidious",
-          streaming_data: {
-            hlsManifestUrl: url
-          }
-        };
-
-      }
 
       const formats = [];
 
