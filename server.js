@@ -308,7 +308,6 @@ async function fetchFromInnertube(id) {
 async function fetchStreamingInfo(id) {
 
   try { return await fetchFromInvidious(id); } catch {}
-  try { return await fetchFromPiped(id); } catch {}
 
   return fetchFromInnertube(id);
 
