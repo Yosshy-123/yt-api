@@ -130,7 +130,7 @@ const fastestFetch = async (instances, buildUrl, parser) => {
         throw new Error('parse failed');
       }
 
-      return parsed;
+      return { instance: base, data: parsed };
     } catch (err) {
       markBad(base);
       throw err;
@@ -139,7 +139,6 @@ const fastestFetch = async (instances, buildUrl, parser) => {
 
   const result = await Promise.any(tasks);
 
-  // cancel remaining requests
   controllers.forEach((c) => c.abort());
 
   return result;
@@ -149,7 +148,7 @@ const fastestFetch = async (instances, buildUrl, parser) => {
 const fetchFromInvidious = async (id) => {
   const instances = rotateInstances(INVIDIOUS_INSTANCES);
 
-  return fastestFetch(
+  const result = await fastestFetch(
     instances,
     (base) => `${base}/api/v1/videos/${id}`,
     (data) => {
@@ -161,11 +160,16 @@ const fetchFromInvidious = async (id) => {
       if (!formats.length) return null;
 
       return {
-        provider: 'invidious',
         streaming_data: { formats },
       };
     }
   );
+
+  return {
+    provider: 'invidious',
+    instance: result.instance,
+    streaming_data: result.data.streaming_data,
+  };
 };
 
 const fetchFromInnertube = async (id) => {
@@ -252,13 +256,19 @@ app.get('/api/stream', verifyWorkerAuth, async (req, res) => {
         video_url: parseUrl(video),
         audio_url: parseUrl(audio),
         provider: info.provider,
+        instance: info.instance || null
       });
     }
 
     // Progressive (muxed)
     const progressive = selectBestProgressive(formats);
     if (progressive) {
-      return res.json({ type: 'progressive', url: parseUrl(progressive), provider: info.provider });
+      return res.json({
+        type: 'progressive',
+        url: parseUrl(progressive),
+        provider: info.provider,
+       instance: info.instance || null
+      });
     }
 
     return res.status(404).json({ error: 'no stream' });
