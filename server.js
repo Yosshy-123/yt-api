@@ -27,24 +27,6 @@ const INVIDIOUS_INSTANCES = [
   "https://yewtu.be",
 ];
 
-const PIPED_INSTANCES = [
-  "https://pipedapi.kavin.rocks",
-  "https://pipedapi.leptons.xyz",
-  "https://pipedapi.nosebs.ru",
-  "https://pipedapi-libre.kavin.rocks",
-  "https://piped-api.privacy.com.de",
-  "https://pipedapi.adminforge.de",
-  "https://api.piped.yt",
-  "https://pipedapi.drgns.space",
-  "https://pipedapi.owo.si",
-  "https://pipedapi.ducks.party",
-  "https://piped-api.codespace.cz",
-  "https://pipedapi.reallyaweso.me",
-  "https://api.piped.private.coffee",
-  "https://pipedapi.darkness.services",
-  "https://pipedapi.orangenet.cc",
-];
-
 /* ---------------- Innertube ---------------- */
 
 let ytClient;
@@ -62,7 +44,7 @@ async function getYtClient() {
 /* ---------------- Instance Health ---------------- */
 
 const badInstances = new Map();
-const nextIndex = { invidious: 0, piped: 0 };
+const nextIndex = { invidious: 0 };
 
 function markBad(instance) {
   badInstances.set(instance, Date.now());
@@ -300,47 +282,6 @@ async function fetchFromInvidious(id) {
 
       return {
         provider: "invidious",
-        streaming_data: { formats }
-      };
-
-    }
-  );
-
-}
-
-async function fetchFromPiped(id) {
-
-  const instances = rotateInstances(
-    PIPED_INSTANCES,
-    "piped"
-  );
-
-  return fastestFetch(
-    instances,
-    base => `${base}/streams/${id}`,
-    data => {
-
-      if (data.hls) {
-
-        return {
-          provider: "piped",
-          streaming_data: { hlsManifestUrl: data.hls }
-        };
-
-      }
-
-      const formats = [];
-
-      if (data.videoStreams)
-        data.videoStreams.forEach(v => formats.push(v));
-
-      if (data.audioStreams)
-        data.audioStreams.forEach(a => formats.push(a));
-
-      if (!formats.length) return null;
-
-      return {
-        provider: "piped",
         streaming_data: { formats }
       };
 
