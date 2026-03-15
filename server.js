@@ -2,6 +2,7 @@ import express from 'express';
 import { Innertube } from 'youtubei.js';
 import crypto from 'crypto';
 
+// ======= Configuration =======
 const { WORKER_SECRET, PORT } = process.env;
 if (!WORKER_SECRET) {
   console.error('WORKER_SECRET is required');
@@ -9,10 +10,11 @@ if (!WORKER_SECRET) {
 }
 
 const app = express();
-const port = PORT || 3000;
-
-const ALLOWED_WINDOW = 300;
-const INSTANCE_BAN_MS = 5 * 60 * 1000;
+const port = Number(PORT || 3000);
+const ALLOWED_WINDOW = 300; // seconds
+const INSTANCE_BAN_MS = 5 * 60 * 1000; // ms
+const REQUEST_TIMEOUT_MS = 6_000; // per invidious request
+const CACHE_TTL_MS = 30_000; // simple in-memory cache TTL for streaming info
 const YT_ID_REGEX = /^[a-zA-Z0-9_-]{11}$/;
 
 const INVIDIOUS_INSTANCES = [
@@ -26,48 +28,62 @@ const INVIDIOUS_INSTANCES = [
   'https://yewtu.be',
 ];
 
+// ======= Utilities =======
+const log = () => {};
+
+const cache = new Map(); // key -> { ts, value }
+const getCached = (k) => {
+  const v = cache.get(k);
+  if (!v) return null;
+  if (Date.now() - v.ts > CACHE_TTL_MS) { cache.delete(k); return null; }
+  return v.value;
+};
+const setCached = (k, value) => cache.set(k, { ts: Date.now(), value });
+
 let ytClient = null;
 const getYtClient = async () => {
-  if (!ytClient) {
-    ytClient = await Innertube.create({
-      client_type: 'ANDROID',
-      generate_session_locally: true,
-    });
-  }
+  if (!ytClient) ytClient = await Innertube.create({ client_type: 'ANDROID', generate_session_locally: true });
   return ytClient;
 };
 
-const badInstances = new Map();
-let rrIndex = 0;
-
+const badInstances = new Map(); // instance -> timestamp
 const markBad = (instance) => badInstances.set(instance, Date.now());
 
 const rotateInstances = (list) => {
-  if (!Array.isArray(list) || list.length === 0) return [];
-  const start = rrIndex % list.length;
-  rrIndex = (start + 1) % list.length;
-  const rotated = [...list.slice(start), ...list.slice(0, start)];
-  const good = rotated.filter((i) => {
+  const now = Date.now();
+  // prefer healthy instances; if none, return original list
+  const healthy = list.filter(i => {
     const t = badInstances.get(i);
     if (!t) return true;
-    if (Date.now() - t > INSTANCE_BAN_MS) {
-      badInstances.delete(i);
-      return true;
-    }
+    if (now - t > INSTANCE_BAN_MS) { badInstances.delete(i); return true; }
     return false;
   });
-  return good.length ? good : rotated;
+  return healthy.length ? healthy : list.slice();
+};
+
+const safeHexEqual = (a, b) => {
+  try {
+    const A = Buffer.from(String(a ?? ''), 'hex');
+    const B = Buffer.from(String(b ?? ''), 'hex');
+    if (A.length !== B.length) return false;
+    return crypto.timingSafeEqual(A, B);
+  } catch (e) {
+    return false;
+  }
 };
 
 const parseUrl = (format) => {
   if (!format) return null;
   if (typeof format === 'string') return format;
   if (format.url) return format.url;
-  const cipher = format.signatureCipher || format.signature_cipher || format.cipher;
+  const cipher = format.signatureCipher || format.signature_cipher || format.cipher || format.s;
   if (!cipher) return null;
   try {
-    return new URLSearchParams(cipher).get('url');
-  } catch {
+    // some invidious formats embed the whole querystring
+    const raw = typeof cipher === 'string' ? cipher : JSON.stringify(cipher);
+    const params = new URLSearchParams(raw);
+    return params.get('url') || null;
+  } catch (e) {
     return null;
   }
 };
@@ -76,199 +92,173 @@ const normalizeFormats = (sd = {}) => [
   ...(sd.formats || []),
   ...(sd.adaptiveFormats || []),
   ...(sd.adaptive_formats || []),
-].map((f) => ({
-  ...f,
-  mime: (f.mimeType || f.mime_type || f.type || '').toLowerCase(),
-}));
+].map((f) => ({ ...f, mime: (f.mimeType || f.mime_type || f.type || '').toLowerCase() }));
 
-const selectBestVideo = (formats) =>
-  formats
-    .filter((f) => f.mime && f.mime.includes('video'))
-    .sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bitrate || 0) - (a.bitrate || 0))[0] || null;
+const selectBestVideo = (formats) => formats
+  .filter(f => f.mime && f.mime.includes('video'))
+  .sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bitrate || 0) - (a.bitrate || 0))[0] || null;
 
-const selectBestAudio = (formats) =>
-  formats
-    .filter((f) => f.mime && f.mime.includes('audio'))
-    .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0] || null;
+const selectBestAudio = (formats) => formats
+  .filter(f => f.mime && f.mime.includes('audio'))
+  .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0] || null;
 
-const selectBestProgressive = (formats) =>
-  formats
-    .filter((f) => f.mime && f.mime.includes('video') && /mp4a|aac|opus/.test(f.mime))
-    .sort((a, b) => (b.height || 0) - (a.height || 0))[0] || null;
+const selectBestProgressive = (formats) => formats
+  .filter((f) => f.mime && f.mime.includes('video') && /mp4a|aac|opus/.test(f.mime))
+  .sort((a, b) => (b.height || 0) - (a.height || 0))[0] || null;
 
+// Abortable fetch with timeout
+const fetchWithTimeout = async (url, opts = {}, timeoutMs = REQUEST_TIMEOUT_MS) => {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...opts, signal: controller.signal });
+    clearTimeout(id);
+    return res;
+  } catch (err) {
+    clearTimeout(id);
+    throw err;
+  }
+};
+
+// Run all instances in parallel and resolve with first successful parsed result.
 const fastestFetch = async (instances, buildUrl, parser) => {
-  const controllers = [];
-  const tasks = instances.map(async (base) => {
-    const controller = new AbortController();
-    controllers.push(controller);
+  const insts = rotateInstances(instances);
+  if (!insts.length) throw new Error('no instances');
+
+  const tasks = insts.map(async (base) => {
+    const url = buildUrl(base);
     try {
-      const res = await fetch(buildUrl(base), { signal: controller.signal });
-      if (!res.ok) {
-        markBad(base);
-        throw new Error('bad response');
-      }
+      const res = await fetchWithTimeout(url);
+      if (!res.ok) { markBad(base); throw new Error(`bad status ${res.status}`); }
       const data = await res.json();
       const parsed = parser(data);
-      if (!parsed) {
-        markBad(base);
-        throw new Error('parse failed');
-      }
+      if (!parsed) { markBad(base); throw new Error('parse failed'); }
       return { instance: base, data: parsed };
     } catch (err) {
+      log('instance failed', base, err?.message || err);
       markBad(base);
       throw err;
     }
   });
-  const result = await Promise.any(tasks);
-  controllers.forEach((c) => c.abort());
-  return result;
+
+  // Promise.any will throw AggregateError if all fail
+  return Promise.any(tasks);
 };
 
+// ======= Providers =======
 const fetchFromInvidious = async (id) => {
-  const instances = rotateInstances(INVIDIOUS_INSTANCES);
-  const result = await fastestFetch(
-    instances,
-    (base) => `${base}/api/v1/videos/${id}`,
-    (data) => {
-      const formats = [];
-      if (Array.isArray(data.formatStreams)) {
-        data.formatStreams.forEach((f) => formats.push({ ...f, mimeType: f.type || f.mimeType }));
-      }
-      if (Array.isArray(data.adaptiveFormats)) {
-        data.adaptiveFormats.forEach((f) => formats.push({ ...f, mimeType: f.type || f.mimeType }));
-      }
-      if (Array.isArray(data.streamingData?.formats)) {
-        data.streamingData.formats.forEach((f) => formats.push(f));
-      }
-      const sd = { formats };
-      const is_live = Boolean(
-        data.liveNow || data.isLive || data.is_live || data.live || data.streamingData?.isLive
-      );
-      return { streaming_data: sd, is_live, raw: data };
-    }
-  );
-  return {
-    provider: 'invidious',
-    instance: result.instance,
-    streaming_data: result.data.streaming_data,
-    is_live: result.data.is_live,
-    raw: result.data.raw,
-  };
+  const cacheKey = `invidious:${id}`;
+  const cached = getCached(cacheKey);
+  if (cached) return cached;
+
+  const result = await fastestFetch(INVIDIOUS_INSTANCES, (base) => `${base.replace(/\/+$/,'')}/api/v1/videos/${id}`, (data) => {
+    const formats = [];
+    if (Array.isArray(data.formatStreams)) data.formatStreams.forEach((f) => formats.push({ ...f, mimeType: f.type || f.mimeType }));
+    if (Array.isArray(data.adaptiveFormats)) data.adaptiveFormats.forEach((f) => formats.push({ ...f, mimeType: f.type || f.mimeType }));
+    if (Array.isArray(data.streamingData?.formats)) data.streamingData.formats.forEach((f) => formats.push(f));
+    const sd = { formats };
+    const is_live = Boolean(data.liveNow || data.isLive || data.is_live || data.live || data.streamingData?.isLive);
+    return { streaming_data: sd, is_live, raw: data };
+  });
+
+  const out = { provider: 'invidious', instance: result.instance, streaming_data: result.data.streaming_data, is_live: result.data.is_live, raw: result.data.raw };
+  setCached(cacheKey, out);
+  return out;
 };
 
 const fetchFromInnertube = async (id) => {
+  const cacheKey = `innertube:${id}`;
+  const cached = getCached(cacheKey);
+  if (cached) return cached;
+
   const client = await getYtClient();
   const info = await client.getInfo(id);
   if (!info?.streaming_data && !info?.player_response) throw new Error('No streaming data');
   const sd = info.streaming_data || info.player_response?.streamingData || {};
   const is_live = Boolean(
-    info?.video_details?.isLive ||
-    info?.basic_info?.is_live ||
-    info?.microformat?.isLive ||
-    info?.player_response?.playabilityStatus?.liveStreamability ||
-    info?.player_response?.videoDetails?.isLive ||
+    info?.video_details?.isLive || info?.basic_info?.is_live || info?.microformat?.isLive ||
+    info?.player_response?.playabilityStatus?.liveStreamability || info?.player_response?.videoDetails?.isLive ||
     info?.playability_status?.status === 'LIVE'
   );
-  return {
-    provider: 'innertube',
-    streaming_data: sd,
-    is_live,
-    raw: info,
-  };
+
+  const out = { provider: 'innertube', streaming_data: sd, is_live, raw: info };
+  setCached(cacheKey, out);
+  return out;
 };
 
 const fetchStreamingInfo = async (id) => {
-  try {
-    return await fetchFromInvidious(id);
-  } catch (e) {
-    return fetchFromInnertube(id);
-  }
+  // try invidious first for speed and to reduce Innertube calls
+  try { return await fetchFromInvidious(id); } catch (e) { log('invidious failed, falling back to innertube', e?.message || e); }
+  return fetchFromInnertube(id);
 };
 
-const safeEqual = (a, b) => {
-  try {
-    const A = Buffer.from(String(a), 'hex');
-    const B = Buffer.from(String(b), 'hex');
-    if (A.length !== B.length) return false;
-    return crypto.timingSafeEqual(A, B);
-  } catch {
-    return false;
-  }
-};
+// ======= Auth middleware =======
+const makeError = (res, status = 401) => res.status(status).json({ type: 'error', title: null, video_url: null, audio_url: null, info: { provider: null, url: null } });
 
 const verifyWorkerAuth = (req, res, next) => {
   const ts = req.header('x-proxy-timestamp');
   const sig = req.header('x-proxy-signature');
-  if (!ts || !sig) return res.status(401).json({ error: 'unauthorized' });
+  if (!ts || !sig) return makeError(res, 401);
   const now = Math.floor(Date.now() / 1000);
   const t = Number(ts);
-  if (!Number.isFinite(t) || Math.abs(now - t) > ALLOWED_WINDOW)
-    return res.status(401).json({ error: 'unauthorized' });
+  if (!Number.isFinite(t) || Math.abs(now - t) > ALLOWED_WINDOW) return makeError(res, 401);
   const payload = `${ts}:${req.originalUrl}`;
   const expected = crypto.createHmac('sha256', WORKER_SECRET).update(payload).digest('hex');
-  if (!safeEqual(expected, sig)) return res.status(401).json({ error: 'unauthorized' });
+  if (!safeHexEqual(expected, sig)) return makeError(res, 401);
   next();
 };
 
-function isValidVideoId(id) {
-  return typeof id === 'string' && YT_ID_REGEX.test(id);
-}
+// ======= Helpers =======
+function isValidVideoId(id) { return typeof id === 'string' && YT_ID_REGEX.test(id); }
+const makeResponse = ({ type, title = null, video_url = null, audio_url = null, provider = null, url = null }) => ({ type, title, video_url, audio_url, info: { provider, url } });
 
+// ======= Route =======
 app.get('/api/stream', verifyWorkerAuth, async (req, res) => {
   try {
-    const id = req.query.id;
-    if (!id) return res.status(400).json({ error: 'id required' });
-    if (!isValidVideoId(String(id))) return res.status(400).json({ error: 'invalid video id' });
-    const info = await fetchStreamingInfo(String(id));
-    if (info.is_live) return res.status(403).json({ error: 'live streams are not supported' });
+    const id = String(req.query.id || '');
+    if (!id) return res.status(400).json(makeResponse({ type: 'error' }));
+    if (!isValidVideoId(id)) return res.status(400).json(makeResponse({ type: 'error' }));
+
+    const info = await fetchStreamingInfo(id);
+    const raw = info.raw || {};
+    const title = raw.title || raw.videoDetails?.title || raw.video_details?.title || raw.player_response?.videoDetails?.title || raw.player_response?.video_details?.title || raw.microformat?.title?.simpleText || raw.basic_info?.title || null;
+
+    if (info.is_live) return res.status(403).json(makeResponse({ type: 'error', title, provider: info.provider || null, url: info.instance || null }));
+
     const sd = info.streaming_data || {};
-    const hlsCandidates = [
-      sd.hlsManifestUrl,
-      sd.hls_manifest_url,
-      sd.hlsUrl,
-      sd.hls,
-      sd.streamingData?.hlsManifestUrl,
-      sd.streamingData?.hls_manifest_url,
-    ].filter(Boolean);
-    if (hlsCandidates.length) return res.status(403).json({ error: 'live streams are not supported' });
-    const dashCandidates = [
-      sd.dashManifestUrl,
-      sd.dash_manifest_url,
-      sd.streamingData?.dashManifestUrl,
-      sd.streamingData?.dash_manifest_url,
-    ].filter(Boolean);
-    if (dashCandidates.length) return res.status(403).json({ error: 'live streams are not supported' });
+    const hlsCandidates = [sd.hlsManifestUrl, sd.hls_manifest_url, sd.hlsUrl, sd.hls, sd.streamingData?.hlsManifestUrl, sd.streamingData?.hls_manifest_url].filter(Boolean);
+    if (hlsCandidates.length) return res.status(403).json(makeResponse({ type: 'error', title, provider: info.provider || null, url: info.instance || null }));
+
+    const dashCandidates = [sd.dashManifestUrl, sd.dash_manifest_url, sd.streamingData?.dashManifestUrl, sd.streamingData?.dash_manifest_url].filter(Boolean);
+    if (dashCandidates.length) return res.status(403).json(makeResponse({ type: 'error', title, provider: info.provider || null, url: info.instance || null }));
+
     const formats = normalizeFormats(sd);
-    if (!formats.length) return res.status(404).json({ error: 'no stream' });
-    const containsHlsFormat = formats.some((f) => {
-      const url = parseUrl(f) || '';
-      return (f.mime && f.mime.includes('mpegurl')) || url.includes('.m3u8') || /application\/vnd\.apple\.mpegurl/.test(f.mime || '');
-    });
-    if (containsHlsFormat) return res.status(403).json({ error: 'live streams are not supported' });
+    if (!formats.length) return res.status(404).json(makeResponse({ type: 'error', title, provider: info.provider || null, url: info.instance || null }));
+
+    const containsHlsFormat = formats.some((f) => { const url = parseUrl(f) || ''; return (f.mime && f.mime.includes('mpegurl')) || url.includes('.m3u8') || /application\/vnd\.apple\.mpegurl/.test(f.mime || ''); });
+    if (containsHlsFormat) return res.status(403).json(makeResponse({ type: 'error', title, provider: info.provider || null, url: info.instance || null }));
+
     const video = selectBestVideo(formats);
     const audio = selectBestAudio(formats);
     if (video && audio) {
-      return res.json({
-        type: 'dash',
-        video_url: parseUrl(video),
-        audio_url: parseUrl(audio),
-        provider: info.provider,
-        instance: info.instance || null,
-      });
+      return res.json(makeResponse({ type: 'dash', title, video_url: parseUrl(video), audio_url: parseUrl(audio), provider: info.provider || null, url: info.instance || null }));
     }
+
     const progressive = selectBestProgressive(formats);
     if (progressive) {
-      return res.json({
-        type: 'progressive',
-        url: parseUrl(progressive),
-        provider: info.provider,
-        instance: info.instance || null,
-      });
+      return res.json(makeResponse({ type: 'progressive', title: parseUrl(progressive), url: info.instance || null }));
     }
-    return res.status(404).json({ error: 'no stream' });
+
+    return res.status(404).json(makeResponse({ type: 'error', title, provider: info.provider || null, url: info.instance || null }));
   } catch (e) {
-    return res.status(500).json({ error: e?.message || 'internal error' });
+    log('unexpected error', e?.message || e);
+    return res.status(500).json(makeResponse({ type: 'error', title: null, provider: null, url: null }));
   }
 });
 
-app.listen(port, () => console.log(`Server running on ${port}`));
+// ======= Startup =======
+const server = app.listen(port, () => console.log(`Server listening on ${port}`));
+
+// graceful shutdown
+process.on('SIGINT', () => server.close(() => process.exit(0)));
+process.on('SIGTERM', () => server.close(() => process.exit(0)));
