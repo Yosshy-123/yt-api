@@ -3,10 +3,7 @@ import { Innertube } from 'youtubei.js';
 import crypto from 'crypto';
 
 const { WORKER_SECRET, PORT } = process.env;
-if (!WORKER_SECRET) {
-  console.error('WORKER_SECRET is required');
-  process.exit(1);
-}
+if (!WORKER_SECRET) process.exit(1);
 
 const app = express();
 const port = PORT || 3000;
@@ -34,6 +31,7 @@ const getYtClient = async () => {
 
 const badInstances = new Map();
 let rrIndex = 0;
+const markBad = (instance) => badInstances.set(instance, Date.now());
 const rotateInstances = (list) => {
   if (!Array.isArray(list) || list.length === 0) return [];
   const start = rrIndex % list.length;
@@ -50,7 +48,13 @@ const rotateInstances = (list) => {
   });
   return healthy.length ? healthy : rotated;
 };
-const markBad = (instance) => badInstances.set(instance, Date.now());
+
+const absolute = (base, path) => {
+  if (!path) return null;
+  if (/^https?:\/\//i.test(path)) return path;
+  if (!base) return path;
+  return base.replace(/\/$/, '') + (path.startsWith('/') ? path : '/' + path);
+};
 
 const parseUrl = (fmt) => {
   if (!fmt) return null;
@@ -75,9 +79,7 @@ const normalizeFormats = (sd = {}) => {
   return raw.map((f) => ({ ...f, mime: (f.mimeType || f.mime_type || f.type || '').toLowerCase() }));
 };
 
-const pick = (formats, predicate, compare) => {
-  return formats.filter(predicate).sort(compare)[0] || null;
-};
+const pick = (formats, predicate, compare) => formats.filter(predicate).sort(compare)[0] || null;
 
 const selectBestVideo = (fmts) =>
   pick(fmts, (f) => (f.mime || '').includes('video'), (a, b) => (b.height || 0) - (a.height || 0) || (b.bitrate || 0) - (a.bitrate || 0));
@@ -86,11 +88,7 @@ const selectBestAudio = (fmts) =>
   pick(fmts, (f) => (f.mime || '').includes('audio'), (a, b) => (b.bitrate || 0) - (a.bitrate || 0));
 
 const selectBestProgressive = (fmts) =>
-  pick(
-    fmts,
-    (f) => (f.mime || '').includes('video') && /mp4a|aac|opus/.test(f.mime),
-    (a, b) => (b.height || 0) - (a.height || 0)
-  );
+  pick(fmts, (f) => (f.mime || '').includes('video') && /mp4a|aac|opus/.test(f.mime), (a, b) => (b.height || 0) - (a.height || 0));
 
 const fastestFetch = async (instances, buildUrl, parser) => {
   const controllers = [];
@@ -118,13 +116,6 @@ const fastestFetch = async (instances, buildUrl, parser) => {
   const result = await Promise.any(tasks);
   controllers.forEach((c) => c.abort());
   return result;
-};
-
-const absolute = (base, path) => {
-  if (!path) return null;
-  if (/^https?:\/\//i.test(path)) return path;
-  if (!base) return path;
-  return base.replace(/\/$/, '') + (path.startsWith('/') ? path : '/' + path);
 };
 
 const extractGoogleHls = async (variantUrl, instance) => {
@@ -172,6 +163,9 @@ const fetchFromInvidious = async (id) => {
   if (streaming.hls) {
     const google = await extractGoogleHls(streaming.hls, instance);
     if (google) streaming.hls = google;
+    else {
+      streaming.hls = absolute(instance, streaming.hls);
+    }
   }
   return { provider: 'invidious', instance, streaming_data: streaming };
 };
@@ -180,18 +174,35 @@ const fetchFromInnertube = async (id) => {
   const client = await getYtClient();
   const info = await client.getInfo(id);
   if (!info) throw new Error('no info');
-  return { provider: 'innertube', streaming_data: info.streaming_data || info.streamingData || {} };
+  const sd = info.streaming_data || info.streamingData || {};
+  const hls = sd.hlsManifestUrl || sd.hls_manifest_url || sd.hlsUrl || sd.hls;
+  if (hls) {
+    try {
+      const head = await fetch(hls, { method: 'HEAD' });
+      if (head.ok) return { provider: 'innertube', streaming_data: { hls: hls, ...sd } };
+    } catch {}
+    try {
+      const get = await fetch(hls);
+      if (get.ok) return { provider: 'innertube', streaming_data: { hls: hls, ...sd } };
+    } catch {}
+  }
+  return { provider: 'innertube', streaming_data: sd };
 };
 
 const fetchStreamingInfo = async (id) => {
   try {
+    const fromIt = await fetchFromInnertube(id);
+    if (fromIt.streaming_data && fromIt.streaming_data.hls) return fromIt;
+  } catch {}
+  try {
     const fromInv = await fetchFromInvidious(id);
     if (fromInv.streaming_data && fromInv.streaming_data.hls) return fromInv;
-    const fromIt = await fetchFromInnertube(id);
-    if (fromIt.streaming_data && (fromIt.streaming_data.hlsManifestUrl || fromIt.streaming_data.hls_manifest_url || fromIt.streaming_data.hls)) return fromIt;
-    return fromInv.streaming_data && Object.keys(fromInv.streaming_data).length ? fromInv : fromIt;
+  } catch {}
+  try {
+    const fallbackIt = await fetchFromInnertube(id);
+    return fallbackIt;
   } catch (e) {
-    return fetchFromInnertube(id);
+    throw e;
   }
 };
 
@@ -248,4 +259,4 @@ app.get('/api/stream', verifyWorkerAuth, async (req, res) => {
   }
 });
 
-app.listen(port, () => console.log(`Server running on ${port}`));
+app.listen(port, () => console.log(`running on ${port}`));
