@@ -109,6 +109,13 @@ const uniqByKey = (items, keyFn) => {
 const flattenArrays = (...values) =>
   values.flatMap((v) => (Array.isArray(v) ? v : [])).filter(Boolean);
 
+const pickRequestedFormats = (raw = {}, sd = {}) =>
+  flattenArrays(
+    raw.requested_formats,
+    sd.requested_formats,
+    sd.streamingData?.requested_formats
+  ).filter((v) => v && typeof v === 'object');
+
 // ------------------------
 // Auth
 // ------------------------
@@ -144,8 +151,6 @@ const runYtDlp = async (videoId, { useProxy = false } = {}) => {
     '--no-playlist',
     '--no-warnings',
     '--no-progress',
-    '--format',
-    'bestvideo*+bestaudio/best',
     '--extractor-args',
     'youtube:player_client=android',
   ];
@@ -308,6 +313,9 @@ const fastestFetch = async (instances, buildUrl, parser) => {
   }
 };
 
+// ------------------------
+// Format normalization
+// ------------------------
 const collectFormats = (raw = {}, sd = {}) => {
   const sources = flattenArrays(
     raw.formats,
@@ -538,12 +546,42 @@ const buildSdFromRaw = (raw = {}) => {
     sd.streamingData = raw.streamingData;
   }
 
+  if (Array.isArray(raw.adaptiveFormats)) sd.adaptiveFormats = raw.adaptiveFormats;
+  if (Array.isArray(raw.adaptive_formats)) sd.adaptive_formats = raw.adaptive_formats;
+  if (Array.isArray(raw.formatStreams)) sd.formatStreams = raw.formatStreams;
+
   return sd;
 };
 
 // ------------------------
 // Resource selection
 // ------------------------
+const selectDashFromRequested = (raw = {}, sd = {}) => {
+  const requested = pickRequestedFormats(raw, sd);
+  if (requested.length < 2) return null;
+
+  const normalized = collectFormats(
+    {
+      requested_formats: requested,
+    },
+    {}
+  );
+
+  const video = normalized.find(isVideoOnly);
+  const audio = normalized.find(isAudioOnly);
+
+  if (video && audio) {
+    return {
+      kind: 'dash',
+      videourl: parseUrlFromFormat(video),
+      audiourl: parseUrlFromFormat(audio),
+      source: 'requested_formats',
+    };
+  }
+
+  return null;
+};
+
 const normalizeResourceChoice = (raw = {}, sd = {}) => {
   const formats = collectFormats(raw, sd);
   const is_live = isLiveLike(raw, sd, formats);
@@ -558,6 +596,11 @@ const normalizeResourceChoice = (raw = {}, sd = {}) => {
       };
     }
     return null;
+  }
+
+  const requestedDash = selectDashFromRequested(raw, sd);
+  if (requestedDash?.videourl && requestedDash?.audiourl) {
+    return requestedDash;
   }
 
   const video = selectBestVideo(formats);
@@ -604,22 +647,19 @@ const fetchFromYtDlp = async (id, { useProxy = false } = {}) => {
 const parseInvidiousVideo = (data) => {
   if (!data || typeof data !== 'object') return null;
 
-  const formats = collectFormats(data, data);
+  const sd = buildSdFromRaw(data);
+  const formats = collectFormats(data, sd);
+
   const is_live = Boolean(
     data.liveNow ||
       data.isLive ||
       data.is_live ||
       data.live ||
       data.live_status === 'is_live' ||
-      data.streamingData?.isLive ||
-      containsManifestLikeFormat(formats)
+      sd.streamingData?.isLive ||
+      containsManifestLikeFormat(formats) ||
+      hasManifestInSd(sd)
   );
-
-  const sd = {
-    formats: Array.isArray(data.formats) ? data.formats : [],
-    requested_formats: Array.isArray(data.requested_formats) ? data.requested_formats : [],
-    streamingData: data.streamingData && typeof data.streamingData === 'object' ? data.streamingData : undefined,
-  };
 
   return {
     streaming_data: sd,
@@ -683,13 +723,13 @@ app.get('/api/stream', verifyWorkerAuth, async (req, res) => {
     const formats = collectFormats(raw, sd);
     const is_live = isLiveLike(raw, sd, formats);
 
+    const title = extractTitle(raw) || '';
+
     if (is_live) {
       const manifest = extractManifest(raw, sd, true);
       if (!manifest) {
         return res.status(404).json({ error: 'no stream' });
       }
-
-      const title = extractTitle(raw) || '';
 
       return res.json({
         resourcetype: manifest.kind || 'hls',
@@ -703,7 +743,6 @@ app.get('/api/stream', verifyWorkerAuth, async (req, res) => {
       return res.status(404).json({ error: 'no stream' });
     }
 
-    const title = extractTitle(raw) || '';
     const choice = normalizeResourceChoice(raw, sd);
 
     if (!choice) {
