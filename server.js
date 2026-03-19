@@ -127,6 +127,10 @@ const runYtDlp = async (videoId, { useProxy = false } = {}) => {
     child.on('close', (code, signal) => {
       clearTimeout(timer);
 
+      console.error('yt-dlp exit:', { code, signal });
+      console.error('stderr:', stderr);
+      console.error('stdout:', stdout.slice(0, 500));
+
       if (code !== 0) {
         return reject(
           new Error(
