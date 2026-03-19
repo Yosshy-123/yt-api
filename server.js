@@ -631,16 +631,19 @@ const parseInvidiousVideo = (data) => {
   if (!data || typeof data !== 'object') return null;
 
   const sd = buildSdFromRaw(data);
-  const formats = collectFormats(data, sd);
 
   const is_live = Boolean(
     data.liveNow ||
-      data.isLive ||
-      data.is_live ||
-      data.live ||
-      data.live_status === 'is_live' ||
-      sd.streamingData?.isLive
+    data.isLive ||
+    data.is_live ||
+    data.live ||
+    data.live_status === 'is_live' ||
+    sd.streamingData?.isLive
   );
+
+  if (is_live) {
+    throw new Error('skip live on invidious');
+  }
 
   return {
     streaming_data: sd,
