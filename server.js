@@ -248,33 +248,6 @@ const rotateInstances = (list = []) => {
   return available.length ? available : rotated;
 };
 
-const fetchJsonWithTimeout = async (url, timeoutMs) => {
-  const controller = new AbortController();
-  let timedOut = false;
-
-  const timeout = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, timeoutMs);
-
-  try {
-    const res = await fetch(url, {
-      signal: controller.signal,
-      headers: {
-        accept: 'application/json',
-      },
-    });
-
-    if (!res.ok) {
-      throw new Error(`bad response ${res.status} from ${url}`);
-    }
-
-    return await res.json();
-  } finally {
-    clearTimeout(timeout);
-  }
-};
-
 const fastestFetch = async (instances, buildUrl, parser) => {
   if (!instances || !instances.length) throw new Error('no instances');
 
@@ -568,57 +541,38 @@ const buildSdFromRaw = (raw = {}) => {
   return sd;
 };
 
-const normalizeResourceChoice = (raw = {}, sd = {}, preferDirect = true) => {
+// ------------------------
+// Resource selection
+// ------------------------
+const normalizeResourceChoice = (raw = {}, sd = {}) => {
   const formats = collectFormats(raw, sd);
-  const live = isLiveLike(raw, sd, formats);
+  const is_live = isLiveLike(raw, sd, formats);
 
-  const manifest = extractManifest(raw, sd, live);
-  if (manifest) {
-    return {
-      kind: manifest.kind,
-      url: manifest.url,
-      source: 'manifest',
-    };
+  if (is_live) {
+    const manifest = extractManifest(raw, sd, true);
+    if (manifest) {
+      return {
+        kind: manifest.kind,
+        url: manifest.url,
+        source: 'manifest',
+      };
+    }
+    return null;
   }
 
-  const hlsFormat = formats.find((f) => {
-    const url = parseUrlFromFormat(f) || '';
-    return (
-      isHlsUrl(url) ||
-      /application\/vnd\.apple\.mpegurl/i.test(f.mime || '') ||
-      /mpegurl/i.test(f.mime || '')
-    );
-  });
-
-  if (hlsFormat) {
-    return {
-      kind: 'hls',
-      url: parseUrlFromFormat(hlsFormat),
-      source: 'format',
-    };
-  }
-
-  const muxed = selectBestMuxed(formats);
   const video = selectBestVideo(formats);
   const audio = selectBestAudio(formats);
-
-  if (preferDirect && muxed) {
-    return {
-      kind: 'progressive',
-      url: parseUrlFromFormat(muxed),
-      source: 'muxed',
-    };
-  }
 
   if (video && audio) {
     return {
       kind: 'dash',
       videourl: parseUrlFromFormat(video),
       audiourl: parseUrlFromFormat(audio),
-      source: 'dash',
+      source: 'adaptive',
     };
   }
 
+  const muxed = selectBestMuxed(formats);
   if (muxed) {
     return {
       kind: 'progressive',
@@ -727,48 +681,51 @@ app.get('/api/stream', verifyWorkerAuth, async (req, res) => {
     const sd = info.streaming_data || {};
     const raw = info.raw || {};
     const formats = collectFormats(raw, sd);
+    const is_live = isLiveLike(raw, sd, formats);
 
-    if (!formats.length && !hasManifestInSd(sd) && !containsManifestLikeFormat(formats)) {
+    if (is_live) {
+      const manifest = extractManifest(raw, sd, true);
+      if (!manifest) {
+        return res.status(404).json({ error: 'no stream' });
+      }
+
+      const title = extractTitle(raw) || '';
+
+      return res.json({
+        resourcetype: manifest.kind || 'hls',
+        title,
+        url: manifest.url,
+        provider: info.provider,
+      });
+    }
+
+    if (!formats.length) {
       return res.status(404).json({ error: 'no stream' });
     }
 
     const title = extractTitle(raw) || '';
+    const choice = normalizeResourceChoice(raw, sd);
 
-    const choice = normalizeResourceChoice(raw, sd, true);
+    if (!choice) {
+      return res.status(404).json({ error: 'no stream' });
+    }
 
-    if (choice) {
-      if (choice.kind === 'dash') {
-        if (choice.videourl && choice.audiourl) {
-          return res.json({
-            resourcetype: 'dash',
-            title,
-            videourl: choice.videourl,
-            audiourl: choice.audiourl,
-            provider: info.provider,
-          });
-        }
-
-        // DASH manifest fallback
+    if (choice.kind === 'dash') {
+      if (choice.videourl && choice.audiourl) {
         return res.json({
           resourcetype: 'dash',
           title,
-          url: choice.url,
+          videourl: choice.videourl,
+          audiourl: choice.audiourl,
           provider: info.provider,
         });
       }
+      return res.status(404).json({ error: 'no stream' });
+    }
 
-      if (choice.kind === 'progressive') {
-        return res.json({
-          resourcetype: 'progressive',
-          title,
-          url: choice.url,
-          provider: info.provider,
-        });
-      }
-
-      // HLS or generic manifest fallback
+    if (choice.kind === 'progressive') {
       return res.json({
-        resourcetype: 'hls',
+        resourcetype: 'progressive',
         title,
         url: choice.url,
         provider: info.provider,
