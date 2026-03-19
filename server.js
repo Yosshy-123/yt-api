@@ -6,7 +6,11 @@ import { spawn } from 'node:child_process';
 // ------------------------
 // Config
 // ------------------------
-const { WORKER_SECRET, PORT = 3000, PROXY_URL } = process.env;
+const {
+  WORKER_SECRET,
+  PORT = 3000,
+  PROXY_URL,
+} = process.env;
 
 if (!WORKER_SECRET) {
   console.error('WORKER_SECRET is required');
@@ -14,60 +18,29 @@ if (!WORKER_SECRET) {
 }
 
 const app = express();
-const port = Number(PORT) || 3000;
+const port = Number(PORT);
 
-const ALLOWED_WINDOW_SECONDS = 300;
-const REQUEST_TIMEOUT_MS = 5000;
-const INSTANCE_BAN_MS = 5 * 60 * 1000;
-const YT_DLP_TIMEOUT_MS = 10000;
 const YT_DLP_BIN = '/opt/venv/bin/yt-dlp';
-
 const YT_ID_REGEX = /^[a-zA-Z0-9_-]{11}$/;
 
-const INVIDIOUS_INSTANCES = [
-  'https://inv.nadeko.net',
-  'https://invidious.f5.si',
-  'https://invidious.lunivers.trade',
-  'https://iv.melmac.space',
-  'https://yt.omada.cafe',
-  'https://invidious.nerdvpn.de',
-  'https://invidious.tiekoetter.com',
-  'https://yewtu.be',
-];
+const TIMEOUT = 10000;
 
 // ------------------------
 // Auth
 // ------------------------
-const safeEqualHex = (a, b) => {
-  try {
-    const A = Buffer.from(String(a), 'hex');
-    const B = Buffer.from(String(b), 'hex');
-    if (A.length !== B.length) return false;
-    return crypto.timingSafeEqual(A, B);
-  } catch {
-    return false;
-  }
-};
-
 const verifyWorkerAuth = (req, res, next) => {
   const ts = req.header('x-proxy-timestamp');
   const sig = req.header('x-proxy-signature');
 
-  if (!ts || !sig) return res.status(401).json({ error: 'unauthorized' });
-
-  const now = Math.floor(Date.now() / 1000);
-  const t = Number(ts);
-
-  if (!Number.isFinite(t) || Math.abs(now - t) > ALLOWED_WINDOW_SECONDS) {
-    return res.status(401).json({ error: 'unauthorized' });
-  }
+  if (!ts || !sig) return res.status(401).end();
 
   const payload = `${ts}:${req.originalUrl}`;
-  const expected = crypto.createHmac('sha256', WORKER_SECRET).update(payload).digest('hex');
+  const expected = crypto
+    .createHmac('sha256', WORKER_SECRET)
+    .update(payload)
+    .digest('hex');
 
-  if (!safeEqualHex(expected, sig)) {
-    return res.status(401).json({ error: 'unauthorized' });
-  }
+  if (expected !== sig) return res.status(401).end();
 
   next();
 };
@@ -75,8 +48,8 @@ const verifyWorkerAuth = (req, res, next) => {
 // ------------------------
 // yt-dlp
 // ------------------------
-const runYtDlp = (videoId, { useProxy = false } = {}) => {
-  const url = `https://www.youtube.com/watch?v=${videoId}`;
+const runYtDlp = (id, { proxy = false } = {}) => {
+  const url = `https://www.youtube.com/watch?v=${id}`;
 
   const args = [
     '--dump-single-json',
@@ -84,34 +57,33 @@ const runYtDlp = (videoId, { useProxy = false } = {}) => {
     '--no-warnings',
     '--no-progress',
     '--skip-download',
-    '--extractor-args', 'youtube:player_client=android',
     url,
   ];
 
-  if (useProxy && PROXY_URL) {
+  if (proxy && PROXY_URL) {
     args.unshift('--proxy', PROXY_URL);
   }
 
   return new Promise((resolve, reject) => {
-    const child = spawn(YT_DLP_BIN, args);
+    const p = spawn(YT_DLP_BIN, args);
 
-    let stdout = '';
-    let stderr = '';
+    let out = '';
+    let err = '';
 
-    const timer = setTimeout(() => child.kill('SIGKILL'), YT_DLP_TIMEOUT_MS);
+    const t = setTimeout(() => p.kill('SIGKILL'), TIMEOUT);
 
-    child.stdout.on('data', d => (stdout += d.toString()));
-    child.stderr.on('data', d => (stderr += d.toString()));
+    p.stdout.on('data', d => out += d);
+    p.stderr.on('data', d => err += d);
 
-    child.on('close', (code) => {
-      clearTimeout(timer);
+    p.on('close', code => {
+      clearTimeout(t);
 
       if (code !== 0) {
-        return reject(new Error(stderr));
+        return reject(new Error(err || 'yt-dlp failed'));
       }
 
       try {
-        resolve(JSON.parse(stdout));
+        resolve(JSON.parse(out));
       } catch {
         reject(new Error('invalid json'));
       }
@@ -120,10 +92,9 @@ const runYtDlp = (videoId, { useProxy = false } = {}) => {
 };
 
 // ------------------------
-// Format Utils
+// Format normalize（最重要）
 // ------------------------
-const parseUrl = (f) => {
-  if (!f) return null;
+const extractUrl = (f) => {
   if (f.url) return f.url;
 
   const cipher = f.signatureCipher || f.cipher;
@@ -137,66 +108,80 @@ const parseUrl = (f) => {
 };
 
 const normalizeFormats = (raw = {}) => {
-  const list = raw.formats || [];
+  const list = [
+    ...(raw.formats || []),
+    ...(raw.requested_formats || []),
+  ];
 
   return list
-    .map(f => ({
-      ...f,
-      url: parseUrl(f),
-      mime: String(f.mimeType || f.type || '').toLowerCase(),
-    }))
+    .map(f => {
+      const url = extractUrl(f);
+
+      return {
+        ...f,
+        url,
+        mime: String(f.mimeType || f.type || '').toLowerCase(),
+      };
+    })
     .filter(f => f.url);
 };
 
-const bestVideo = (f) =>
-  f
-    .filter(x => x.mime.includes('video') && !x.mime.includes('audio'))
-    .sort((a, b) =>
-      (b.height || 0) - (a.height || 0) ||
-      (b.fps || 0) - (a.fps || 0) ||
-      (b.bitrate || 0) - (a.bitrate || 0)
-    )[0];
+// ------------------------
+// Selector（品質最優先）
+// ------------------------
+const sortVideo = (a, b) =>
+  (b.height || 0) - (a.height || 0) ||
+  (b.fps || 0) - (a.fps || 0) ||
+  (b.bitrate || 0) - (a.bitrate || 0);
 
-const bestAudio = (f) =>
-  f
-    .filter(x => x.mime.includes('audio'))
-    .sort((a, b) =>
-      (b.abr || 0) - (a.abr || 0) ||
-      (b.bitrate || 0) - (a.bitrate || 0)
-    )[0];
+const sortAudio = (a, b) =>
+  (b.abr || 0) - (a.abr || 0) ||
+  (b.bitrate || 0) - (a.bitrate || 0);
 
-const bestMuxed = (f) =>
-  f
-    .filter(x => x.mime.includes('video') && x.mime.includes('audio'))
-    .sort((a, b) =>
-      (b.height || 0) - (a.height || 0) ||
-      (b.bitrate || 0) - (a.bitrate || 0)
-    )[0];
+const getBestVideo = (f) =>
+  f.filter(x => x.mime.includes('video') && !x.mime.includes('audio'))
+   .sort(sortVideo)[0];
 
-const findHLS = (f) =>
+const getBestAudio = (f) =>
+  f.filter(x => x.mime.includes('audio'))
+   .sort(sortAudio)[0];
+
+const getBestMuxed = (f) =>
+  f.filter(x => x.mime.includes('video') && x.mime.includes('audio'))
+   .sort(sortVideo)[0];
+
+const getHLS = (f) =>
   f.find(x =>
-    x.url?.includes('.m3u8') ||
+    x.url.includes('.m3u8') ||
     x.mime.includes('mpegurl')
   );
 
 // ------------------------
-// Invidious
+// Invidious（品質対応）
 // ------------------------
-const fetchInvidious = async (id) => {
-  for (const base of INVIDIOUS_INSTANCES) {
-    try {
-      const res = await fetch(`${base}/api/v1/videos/${id}`);
-      if (!res.ok) continue;
+const INVIDIOUS = [
+  'https://inv.nadeko.net',
+  'https://invidious.f5.si',
+  'https://invidious.lunivers.trade',
+  'https://iv.melmac.space',
+  'https://yt.omada.cafe',
+  'https://invidious.nerdvpn.de',
+  'https://invidious.tiekoetter.com',
+  'https://yewtu.be',
+];
 
-      const data = await res.json();
+const fetchInv = async (id) => {
+  for (const base of INVIDIOUS) {
+    try {
+      const r = await fetch(`${base}/api/v1/videos/${id}`);
+      if (!r.ok) continue;
+
+      const j = await r.json();
 
       const formats = [
-        ...(data.formatStreams || []),
-        ...(data.adaptiveFormats || []),
-      ].map(f => ({
-        ...f,
-        mimeType: f.type,
-      }));
+        ...(j.formatStreams || []),
+        ...(j.adaptiveFormats || []),
+      ];
 
       return {
         raw: { formats },
@@ -208,22 +193,26 @@ const fetchInvidious = async (id) => {
 };
 
 // ------------------------
-// Unified Fetch
+// Fetch orchestration
 // ------------------------
 const fetchInfo = async (id) => {
   try {
     if (PROXY_URL) {
-      const raw = await runYtDlp(id, { useProxy: true });
-      return { raw, provider: 'yt-dlp(proxy)' };
+      return {
+        raw: await runYtDlp(id, { proxy: true }),
+        provider: 'yt-dlp(proxy)',
+      };
     }
   } catch {}
 
   try {
-    return await fetchInvidious(id);
+    return await fetchInv(id);
   } catch {}
 
-  const raw = await runYtDlp(id);
-  return { raw, provider: 'yt-dlp' };
+  return {
+    raw: await runYtDlp(id),
+    provider: 'yt-dlp',
+  };
 };
 
 // ------------------------
@@ -232,6 +221,7 @@ const fetchInfo = async (id) => {
 app.get('/api/stream', verifyWorkerAuth, async (req, res) => {
   try {
     const id = String(req.query.id || '');
+
     if (!YT_ID_REGEX.test(id)) {
       return res.status(400).json({ error: 'invalid id' });
     }
@@ -240,10 +230,11 @@ app.get('/api/stream', verifyWorkerAuth, async (req, res) => {
     const formats = normalizeFormats(info.raw);
 
     if (!formats.length) {
-      return res.status(404).json({ error: 'no stream' });
+      return res.status(404).json({ error: 'no usable stream (empty formats)' });
     }
 
-    const hls = findHLS(formats);
+    // ---- HLS（ライブ）
+    const hls = getHLS(formats);
     if (hls) {
       return res.json({
         resourcetype: 'hls',
@@ -252,8 +243,9 @@ app.get('/api/stream', verifyWorkerAuth, async (req, res) => {
       });
     }
 
-    const video = bestVideo(formats);
-    const audio = bestAudio(formats);
+    // ---- DASH（最高品質）
+    const video = getBestVideo(formats);
+    const audio = getBestAudio(formats);
 
     if (video && audio) {
       return res.json({
@@ -264,11 +256,22 @@ app.get('/api/stream', verifyWorkerAuth, async (req, res) => {
       });
     }
 
-    const muxed = bestMuxed(formats);
+    // ---- fallback（mux）
+    const muxed = getBestMuxed(formats);
     if (muxed) {
       return res.json({
         resourcetype: 'progressive',
         url: muxed.url,
+        provider: info.provider,
+      });
+    }
+
+    // ---- 最終fallback（videoのみでも返す）
+    const any = formats.sort(sortVideo)[0];
+    if (any) {
+      return res.json({
+        resourcetype: 'fallback',
+        url: any.url,
         provider: info.provider,
       });
     }
