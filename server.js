@@ -415,7 +415,7 @@ const isLiveLike = (raw = {}, sd = {}, formats = []) =>
       raw.liveNow ||
       raw.isLive ||
       raw.live ||
-      sd.isLive ||
+      sd.isLive
       hasManifestInSd(sd) ||
       containsManifestLikeFormat(formats)
   );
