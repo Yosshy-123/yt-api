@@ -4,18 +4,14 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        gnupg \
-        ffmpeg \
         python3 \
-        curl \
+        python3-pip \
         ca-certificates \
+        curl \
     && update-ca-certificates \
+    && pip3 install --no-cache-dir -U yt-dlp \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
-
-RUN curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
-    -o /usr/local/bin/yt-dlp \
-    && chmod +x /usr/local/bin/yt-dlp
 
 WORKDIR /app
 
