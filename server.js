@@ -640,8 +640,7 @@ const fetchFromYtDlp = async (id, { useProxy = false } = {}) => {
   const is_live = isLiveLike(raw, sd, formats);
 
   return {
-    provider: 'yt-dlp',
-    instance: useProxy ? (PROXY_URL || null) : null,
+    provider: useProxy ? 'yt-dlp (proxy)' : 'yt-dlp (direct)',
     streaming_data: sd,
     is_live,
     raw,
@@ -685,8 +684,7 @@ const fetchFromInvidious = async (id) => {
   );
 
   return {
-    provider: 'invidious',
-    instance: result.instance,
+    provider: result.instance,
     streaming_data: result.data.streaming_data,
     is_live: result.data.is_live,
     raw: result.data.raw,
@@ -698,20 +696,20 @@ const fetchStreamingInfo = async (id) => {
     try {
       return await fetchFromYtDlp(id, { useProxy: true });
     } catch (e) {
-      console.warn('proxied yt-dlp failed, falling back to direct yt-dlp:', e?.message || e);
+      console.warn('proxied yt-dlp failed, falling back to invidious:', e?.message || e);
     }
-  }
-
-  try {
-    return await fetchFromYtDlp(id, { useProxy: false });
-  } catch (e) {
-    console.warn('direct yt-dlp failed, falling back to invidious:', e?.message || e);
   }
 
   try {
     return await fetchFromInvidious(id);
   } catch (e) {
-    console.warn('invidious failed:', e?.message || e);
+    console.warn('invidious failed, falling back to direct yt-dlp:', e?.message || e);
+  }
+
+  try {
+    return await fetchFromYtDlp(id, { useProxy: false });
+  } catch (e) {
+    console.warn('direct yt-dlp failed:', e?.message || e);
     throw new Error('all providers failed');
   }
 };
@@ -735,10 +733,6 @@ app.get('/api/stream', verifyWorkerAuth, async (req, res) => {
     }
 
     const title = extractTitle(raw) || '';
-    const provider = {
-      name: info.provider || null,
-      url: info.instance || null,
-    };
 
     const choice = normalizeResourceChoice(raw, sd, true);
 
@@ -750,7 +744,7 @@ app.get('/api/stream', verifyWorkerAuth, async (req, res) => {
             title,
             videourl: choice.videourl,
             audiourl: choice.audiourl,
-            provider,
+            provider: info.provider,
           });
         }
 
