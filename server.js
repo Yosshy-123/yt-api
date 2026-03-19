@@ -379,21 +379,6 @@ const collectFormats = (raw = {}, sd = {}) => {
   });
 };
 
-const hasManifestInSd = (sd = {}) =>
-  MANIFEST_KEYS.some((k) => Boolean(sd?.[k])) ||
-  MANIFEST_KEYS.some((k) => Boolean(sd?.streamingData?.[k]));
-
-const containsManifestLikeFormat = (formats = []) =>
-  formats.some((f) => {
-    const url = parseUrlFromFormat(f) || '';
-    return (
-      isHlsUrl(url) ||
-      isDashUrl(url) ||
-      /application\/vnd\.apple\.mpegurl/i.test(f.mime || '') ||
-      /application\/dash\+xml/i.test(f.mime || '')
-    );
-  });
-
 const extractTitle = (raw = {}) => {
   return (
     raw.title ||
@@ -416,8 +401,6 @@ const isLiveLike = (raw = {}, sd = {}, formats = []) =>
       raw.isLive ||
       raw.live ||
       sd.isLive
-      hasManifestInSd(sd) ||
-      containsManifestLikeFormat(formats)
   );
 
 const extractManifest = (raw = {}, sd = {}, isLive = false) => {
@@ -656,9 +639,7 @@ const parseInvidiousVideo = (data) => {
       data.is_live ||
       data.live ||
       data.live_status === 'is_live' ||
-      sd.streamingData?.isLive ||
-      containsManifestLikeFormat(formats) ||
-      hasManifestInSd(sd)
+      sd.streamingData?.isLive
   );
 
   return {
