@@ -753,7 +753,7 @@ app.get('/api/stream', verifyWorkerAuth, async (req, res) => {
           resourcetype: 'dash',
           title,
           url: choice.url,
-          provider,
+          provider: info.provider,
         });
       }
 
@@ -762,7 +762,7 @@ app.get('/api/stream', verifyWorkerAuth, async (req, res) => {
           resourcetype: 'progressive',
           title,
           url: choice.url,
-          provider,
+          provider: info.provider,
         });
       }
 
@@ -771,7 +771,7 @@ app.get('/api/stream', verifyWorkerAuth, async (req, res) => {
         resourcetype: 'hls',
         title,
         url: choice.url,
-        provider,
+        provider: info.provider,
       });
     }
 
